@@ -1,0 +1,1316 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Aether-Core :: Network Topology Whiteboard</title>
+<style>
+  /* ---------- design tokens ---------- */
+  :root {
+    --bg:       #0b0d12;
+    --panel:    #14181f;
+    --panel-2:  #1a1f28;
+    --panel-3:  #232a35;
+    --border:   #2a313c;
+    --border-2: #353d4a;
+    --text:     #e7ecf2;
+    --muted:    #7f8a9b;
+    --muted-2:  #525a68;
+    --accent:   #6ee7b7;
+    --accent-2: #93c5fd;
+    --danger:   #f87171;
+
+    --firewall: #ef4444;
+    --switch:   #3b82f6;
+    --nas:      #10b981;
+    --server:   #a855f7;
+
+    --grid:     #1c2230;
+    --canvas-bg:#0d1017;
+  }
+
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; height: 100%; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI",
+                 Roboto, "Helvetica Neue", Arial, sans-serif;
+    font-size: 14px;
+    line-height: 1.45;
+    overflow: hidden;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+
+  /* ---------- app shell ---------- */
+  .app {
+    display: grid;
+    grid-template-rows: 48px 1fr;
+    grid-template-columns: 220px 1fr 280px;
+    grid-template-areas:
+      "top    top    top"
+      "left   main   right";
+    height: 100vh;
+  }
+  .topbar     { grid-area: top;   }
+  .palette    { grid-area: left;  }
+  .canvas-wrap{ grid-area: main;  }
+  .properties { grid-area: right; }
+
+  /* ---------- top bar ---------- */
+  .topbar {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 0 18px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+  }
+  .topbar h1 {
+    margin: 0;
+    font-size: 14px; font-weight: 600;
+    letter-spacing: 0.02em;
+  }
+  .topbar h1 .muted { color: var(--muted); font-weight: 400; }
+  .topbar-right { display: flex; align-items: center; gap: 14px; }
+  .counts {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12px; color: var(--muted);
+  }
+  .status {
+    font-size: 12px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    padding: 4px 10px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    background: var(--panel-2);
+    color: var(--muted);
+    display: inline-flex; align-items: center; gap: 8px;
+  }
+  .status .dot {
+    width: 7px; height: 7px; border-radius: 50%;
+    background: var(--danger);
+  }
+  .status.connected            { color: var(--accent); border-color: #234232; }
+  .status.connected .dot       { background: var(--accent); }
+
+  /* ---------- left palette ---------- */
+  .palette {
+    background: var(--panel);
+    border-right: 1px solid var(--border);
+    padding: 14px 12px;
+    overflow-y: auto;
+  }
+  .palette-title {
+    text-transform: uppercase;
+    font-size: 10.5px;
+    font-weight: 600;
+    letter-spacing: 0.1em;
+    color: var(--muted);
+    padding: 10px 4px 6px;
+  }
+  .palette-btn {
+    display: flex; align-items: center; gap: 10px;
+    width: 100%;
+    padding: 9px 10px;
+    background: var(--panel-2);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font: inherit;
+    cursor: pointer;
+    margin-bottom: 6px;
+    text-align: left;
+    transition: border-color .12s, background .12s, transform .08s;
+  }
+  .palette-btn:hover  { border-color: var(--border-2); background: var(--panel-3); }
+  .palette-btn:active { transform: scale(.98); }
+  .palette-btn svg {
+    width: 22px; height: 22px; flex-shrink: 0;
+  }
+  .palette-btn[data-type="firewall"] svg { color: var(--firewall); }
+  .palette-btn[data-type="switch"]   svg { color: var(--switch); }
+  .palette-btn[data-type="nas"]      svg { color: var(--nas); }
+  .palette-btn[data-type="server"]   svg { color: var(--server); }
+  .palette-btn .palette-label { flex: 1; }
+
+  .hint {
+    color: var(--muted);
+    font-size: 12px;
+    padding: 4px 4px;
+    line-height: 1.5;
+  }
+  .hint kbd {
+    background: var(--panel-2); border: 1px solid var(--border);
+    border-radius: 4px; padding: 1px 6px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11px;
+  }
+
+  /* ---------- canvas ---------- */
+  .canvas-wrap {
+    position: relative;
+    background: var(--canvas-bg);
+    overflow: auto;
+  }
+  .canvas-inner {
+    position: relative;
+    width: 1800px;
+    height: 1200px;
+  }
+  .canvas-svg {
+    position: absolute; top: 0; left: 0;
+    width: 100%; height: 100%;
+    pointer-events: none;
+  }
+  .canvas-svg .grid-line  { stroke: var(--grid); stroke-width: 1; fill: none; }
+  .canvas-svg .link-line  {
+    stroke: var(--border-2); stroke-width: 2;
+    fill: none;
+    cursor: pointer;
+    pointer-events: stroke;
+    transition: stroke .12s, stroke-width .12s;
+  }
+  .canvas-svg .link-line:hover { stroke: var(--accent-2); }
+  .canvas-svg .link-line.selected {
+    stroke: var(--accent); stroke-width: 3;
+  }
+  .canvas-svg .link-hit {
+    /* invisible thick line on top of each link for easier click target */
+    stroke: transparent; stroke-width: 14;
+    cursor: pointer; pointer-events: stroke;
+    fill: none;
+  }
+  .canvas-svg .link-label {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 10px;
+    fill: var(--muted);
+    paint-order: stroke;
+    stroke: var(--canvas-bg);
+    stroke-width: 4;
+    stroke-linejoin: round;
+    pointer-events: none;
+  }
+  .canvas-svg .rubber-band {
+    stroke: var(--accent-2);
+    stroke-width: 2;
+    stroke-dasharray: 5,4;
+    fill: none;
+    opacity: 0.85;
+    pointer-events: none;
+  }
+
+  .nodes-layer {
+    position: absolute; top: 0; left: 0;
+    width: 100%; height: 100%;
+    pointer-events: none;
+  }
+
+  /* ---------- node ---------- */
+  .node {
+    position: absolute;
+    left: 0; top: 0;
+    width: 92px;
+    transform: translate(-50%, -50%);
+    cursor: grab;
+    pointer-events: auto;
+    transition: transform .15s ease-out;
+    will-change: transform;
+  }
+  .node.dragging {
+    cursor: grabbing;
+    transition: none;
+    z-index: 20;
+  }
+  .node-body {
+    display: flex; flex-direction: column; align-items: center;
+    padding: 10px 8px 8px;
+    background: var(--panel-2);
+    border: 1.5px solid var(--border-2);
+    border-radius: 9px;
+    transition: border-color .12s, box-shadow .12s, background .12s;
+  }
+  .node:hover .node-body { border-color: var(--muted); background: var(--panel-3); }
+  .node.selected .node-body {
+    box-shadow: 0 0 0 2px var(--accent);
+  }
+  .node.connect-target .node-body {
+    animation: pulse 1.2s ease-in-out infinite;
+  }
+  @keyframes pulse {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(147, 197, 253, 0.55); }
+    50%      { box-shadow: 0 0 0 8px rgba(147, 197, 253, 0.0); }
+  }
+  .node-icon-wrap {
+    width: 44px; height: 44px;
+    display: grid; place-items: center;
+    border-radius: 8px;
+    background: var(--canvas-bg);
+    border: 1px solid var(--border);
+    margin-bottom: 6px;
+  }
+  .node-icon-wrap svg { width: 26px; height: 26px; }
+  .node[data-type="firewall"] .node-icon-wrap svg { color: var(--firewall); }
+  .node[data-type="switch"]   .node-icon-wrap svg { color: var(--switch); }
+  .node[data-type="nas"]      .node-icon-wrap svg { color: var(--nas); }
+  .node[data-type="server"]   .node-icon-wrap svg { color: var(--server); }
+  .node-label {
+    font-size: 11.5px;
+    color: var(--text);
+    text-align: center;
+    max-width: 100%;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    padding: 0 2px;
+  }
+  .node-type {
+    font-size: 9.5px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--muted);
+    margin-top: 2px;
+  }
+
+  /* ---------- empty + connect-hint overlays ---------- */
+  .empty-state {
+    position: absolute; left: 50%; top: 50%;
+    transform: translate(-50%, -50%);
+    color: var(--muted-2);
+    font-size: 13px;
+    pointer-events: none;
+    text-align: center;
+  }
+  .empty-state span { display: block; margin-top: 4px; color: var(--muted); }
+
+  .connect-hint {
+    position: fixed;
+    left: 50%; bottom: 20px; transform: translateX(-50%);
+    background: var(--panel-3);
+    border: 1px solid var(--accent-2);
+    color: var(--text);
+    padding: 8px 14px;
+    border-radius: 999px;
+    font-size: 12.5px;
+    box-shadow: 0 4px 14px rgba(0,0,0,.4);
+    z-index: 50;
+  }
+  .connect-hint kbd {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 4px; padding: 1px 6px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11px;
+    margin-left: 6px;
+  }
+
+  /* ---------- right properties panel ---------- */
+  .properties {
+    background: var(--panel);
+    border-left: 1px solid var(--border);
+    padding: 14px 14px 18px;
+    overflow-y: auto;
+  }
+  .props-empty {
+    color: var(--muted-2);
+    font-size: 12.5px;
+    font-style: italic;
+    padding: 4px 2px;
+  }
+  .props-header {
+    display: flex; align-items: center; gap: 10px;
+    padding: 4px 2px 12px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 12px;
+  }
+  .props-icon {
+    width: 32px; height: 32px;
+    display: grid; place-items: center;
+    border-radius: 6px;
+    background: var(--canvas-bg);
+    border: 1px solid var(--border);
+    flex-shrink: 0;
+  }
+  .props-icon svg { width: 20px; height: 20px; }
+  .props-icon[data-type="firewall"] svg { color: var(--firewall); }
+  .props-icon[data-type="switch"]   svg { color: var(--switch); }
+  .props-icon[data-type="nas"]      svg { color: var(--nas); }
+  .props-icon[data-type="server"]   svg { color: var(--server); }
+  .props-title {
+    font-size: 13px; font-weight: 600;
+    color: var(--text);
+  }
+  .props-sub {
+    font-size: 10.5px; color: var(--muted);
+    text-transform: uppercase; letter-spacing: 0.08em;
+    margin-top: 1px;
+  }
+  .props-field { margin-bottom: 12px; }
+  .props-field label {
+    display: block;
+    font-size: 10.5px; text-transform: uppercase;
+    letter-spacing: 0.08em; color: var(--muted);
+    margin-bottom: 5px;
+  }
+  .props-field input,
+  .props-field select {
+    width: 100%;
+    padding: 7px 10px;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    color: var(--text);
+    font: inherit;
+    font-size: 13px;
+    outline: none;
+  }
+  .props-field input:focus,
+  .props-field select:focus { border-color: var(--accent-2); }
+  .props-field .readonly {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12px;
+    color: var(--muted);
+    padding: 6px 0 0;
+  }
+  .props-actions {
+    display: flex; gap: 8px;
+    margin-top: 14px;
+  }
+  .btn {
+    flex: 1;
+    padding: 8px 10px;
+    background: var(--panel-2);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    font: inherit;
+    font-size: 12.5px;
+    cursor: pointer;
+    transition: border-color .12s, background .12s;
+  }
+  .btn:hover  { border-color: var(--border-2); background: var(--panel-3); }
+  .btn.primary { border-color: #2a4d6b; }
+  .btn.primary:hover { border-color: var(--accent-2); }
+  .btn.danger  { color: var(--danger); border-color: #4a2a2a; }
+  .btn.danger:hover  { border-color: var(--danger); background: #2a1818; }
+</style>
+</head>
+
+<body>
+
+<div class="app">
+
+  <header class="topbar">
+    <h1>Aether-Core <span class="muted">/ network topology</span></h1>
+    <div class="topbar-right">
+      <span class="counts" id="counts">0 devices · 0 links</span>
+      <span class="status" id="status">
+        <span class="dot"></span><span id="status-text">connecting…</span>
+      </span>
+    </div>
+  </header>
+
+  <aside class="palette">
+    <div class="palette-title">add device</div>
+    <button class="palette-btn" data-type="firewall" type="button">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" stroke-linecap="round">
+        <path d="M12 2 L4 5 V11 C4 16 7 20 12 22 C17 20 20 16 20 11 V5 Z"/>
+        <path d="M9 11.5 L11 13.5 L15 9.5"/>
+      </svg>
+      <span class="palette-label">Firewall</span>
+    </button>
+    <button class="palette-btn" data-type="switch" type="button">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" stroke-linecap="round">
+        <rect x="2" y="9" width="20" height="6" rx="1"/>
+        <path d="M6 12 h2 M11 12 h2 M16 12 h2"/>
+        <path d="M7 5 V9 M12 5 V9 M17 5 V9"/>
+        <path d="M7 15 V19 M12 15 V19 M17 15 V19"/>
+      </svg>
+      <span class="palette-label">Core Switch</span>
+    </button>
+    <button class="palette-btn" data-type="nas" type="button">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" stroke-linecap="round">
+        <rect x="3"  y="4"  width="18" height="4" rx="1"/>
+        <rect x="3"  y="10" width="18" height="4" rx="1"/>
+        <rect x="3"  y="16" width="18" height="4" rx="1"/>
+        <circle cx="6" cy="6"  r="0.6" fill="currentColor"/>
+        <circle cx="6" cy="12" r="0.6" fill="currentColor"/>
+        <circle cx="6" cy="18" r="0.6" fill="currentColor"/>
+      </svg>
+      <span class="palette-label">NAS Unit</span>
+    </button>
+    <button class="palette-btn" data-type="server" type="button">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" stroke-linecap="round">
+        <rect x="5" y="3" width="14" height="18" rx="1"/>
+        <path d="M8 7 H16 M8 10 H16 M8 13 H16"/>
+        <circle cx="8.5"  cy="17" r="0.7" fill="currentColor"/>
+        <circle cx="11.5" cy="17" r="0.7" fill="currentColor"/>
+      </svg>
+      <span class="palette-label">App Server</span>
+    </button>
+
+    <div class="palette-title">controls</div>
+    <p class="hint">
+      Click to select. Drag to move.<br>
+      With a node selected, click <em>Connect</em> then click another node to wire them.<br>
+      Press <kbd>Del</kbd> to remove · <kbd>Esc</kbd> to cancel.
+    </p>
+  </aside>
+
+  <main class="canvas-wrap" id="canvas-wrap">
+    <div class="canvas-inner" id="canvas-inner">
+      <svg class="canvas-svg" id="canvas-svg" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <pattern id="grid-pattern" width="40" height="40" patternUnits="userSpaceOnUse">
+            <path d="M 40 0 L 0 0 0 40" class="grid-line"/>
+          </pattern>
+        </defs>
+        <rect width="100%" height="100%" fill="url(#grid-pattern)"/>
+        <g id="links-layer"></g>
+        <line id="rubber-band" class="rubber-band" style="display:none" />
+      </svg>
+      <div class="nodes-layer" id="nodes-layer"></div>
+      <div class="empty-state" id="empty-state">
+        Empty topology.
+        <span>Add a device from the left to begin.</span>
+      </div>
+    </div>
+  </main>
+
+  <aside class="properties" id="properties">
+    <div class="props-empty">Nothing selected.</div>
+  </aside>
+
+</div>
+
+<div id="connect-hint" class="connect-hint" hidden>
+  Click another device to connect <kbd>Esc</kbd> to cancel
+</div>
+
+<script src="aether.js"></script>
+<script>
+(function () {
+  'use strict';
+
+  // ====================================================================
+  // Configuration
+  // ====================================================================
+
+  const NODE_TYPES = {
+    firewall: { label: 'Firewall',    defaultName: 'Edge Firewall'  },
+    switch:   { label: 'Core Switch', defaultName: 'Core Switch'    },
+    nas:      { label: 'NAS Unit',    defaultName: 'NAS Unit'       },
+    server:   { label: 'App Server',  defaultName: 'App Server'     },
+  };
+  const LINK_SPEEDS = ['1Gbps', '10Gbps', '25Gbps', '40Gbps', '100Gbps'];
+  const DEFAULT_SPEED = '10Gbps';
+  const CANVAS_W = 1800, CANVAS_H = 1200;
+
+  // ====================================================================
+  // Aether connection
+  // ====================================================================
+
+  function gatewayUrl() {
+    const params = new URLSearchParams(window.location.search);
+    const override = params.get('gateway');
+    if (override) return override;
+    const host = window.location.hostname || 'localhost';
+    return 'ws://' + host + ':8211';
+  }
+
+  const aether = new Aether(gatewayUrl());
+  window.aether = aether;                              // for console tinkering
+
+  // ====================================================================
+  // DOM
+  // ====================================================================
+
+  const $ = id => document.getElementById(id);
+  const canvasWrap     = $('canvas-wrap');
+  const canvasInner    = $('canvas-inner');
+  const canvasSvg      = $('canvas-svg');
+  const linksLayer     = $('links-layer');
+  const nodesLayer     = $('nodes-layer');
+  const rubberBand     = $('rubber-band');
+  const emptyState     = $('empty-state');
+  const propsPanel     = $('properties');
+  const countsEl       = $('counts');
+  const statusEl       = $('status');
+  const statusTextEl   = $('status-text');
+  const connectHintEl  = $('connect-hint');
+
+  // ====================================================================
+  // SVG icons reused in the properties header
+  // ====================================================================
+
+  const ICONS = {
+    firewall: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" stroke-linecap="round"><path d="M12 2 L4 5 V11 C4 16 7 20 12 22 C17 20 20 16 20 11 V5 Z"/><path d="M9 11.5 L11 13.5 L15 9.5"/></svg>',
+    switch:   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" stroke-linecap="round"><rect x="2" y="9" width="20" height="6" rx="1"/><path d="M6 12 h2 M11 12 h2 M16 12 h2"/><path d="M7 5 V9 M12 5 V9 M17 5 V9"/><path d="M7 15 V19 M12 15 V19 M17 15 V19"/></svg>',
+    nas:      '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" stroke-linecap="round"><rect x="3" y="4" width="18" height="4" rx="1"/><rect x="3" y="10" width="18" height="4" rx="1"/><rect x="3" y="16" width="18" height="4" rx="1"/><circle cx="6" cy="6" r="0.6" fill="currentColor"/><circle cx="6" cy="12" r="0.6" fill="currentColor"/><circle cx="6" cy="18" r="0.6" fill="currentColor"/></svg>',
+    server:   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" stroke-linecap="round"><rect x="5" y="3" width="14" height="18" rx="1"/><path d="M8 7 H16 M8 10 H16 M8 13 H16"/><circle cx="8.5" cy="17" r="0.7" fill="currentColor"/><circle cx="11.5" cy="17" r="0.7" fill="currentColor"/></svg>',
+  };
+
+  // ====================================================================
+  // Local rendering caches (DOM mirrors of aether state)
+  // ====================================================================
+
+  const nodeEls = new Map();   // uuid -> { root, body, iconWrap, labelEl }
+  const linkEls = new Map();   // uuid -> { hit, line, label }
+
+  let selection      = null;   // { kind: 'node'|'link', uuid }
+  let connectingFrom = null;   // node uuid, while in connect mode
+  let dragging       = null;   // { uuid, dx, dy, lastX, lastY, suppressTarget }
+  let pendingRAF     = null;   // pending coord-write rAF id
+  let pendingWrites  = new Map();   // uuid -> {x,y}
+
+  // ====================================================================
+  // Aether <-> local state helpers
+  // ====================================================================
+
+  function readNode(uuid) {
+    const type = aether.get('node:' + uuid + ':type');
+    if (typeof type !== 'string' || !NODE_TYPES[type]) return null;
+    const coords = aether.get('node:' + uuid + ':coords');
+    const label  = aether.get('node:' + uuid + ':label');
+    return {
+      type,
+      label: typeof label === 'string' ? label : NODE_TYPES[type].defaultName,
+      x: coords && typeof coords.x === 'number' ? coords.x : 100,
+      y: coords && typeof coords.y === 'number' ? coords.y : 100,
+    };
+  }
+  function readLink(uuid) {
+    const v = aether.get('link:' + uuid);
+    if (!v || typeof v !== 'object') return null;
+    if (typeof v.from !== 'string' || typeof v.to !== 'string') return null;
+    return {
+      from:  v.from,
+      to:    v.to,
+      speed: typeof v.speed === 'string' ? v.speed : DEFAULT_SPEED,
+    };
+  }
+  function allNodeUuids() {
+    const out = new Set();
+    for (const k of aether.keys()) {
+      const m = k.match(/^node:([^:]+):type$/);
+      if (m) out.add(m[1]);
+    }
+    return out;
+  }
+  function allLinkUuids() {
+    const out = new Set();
+    for (const k of aether.keys()) {
+      const m = k.match(/^link:([^:]+)$/);
+      if (m) out.add(m[1]);
+    }
+    return out;
+  }
+
+  // ====================================================================
+  // Mutation helpers (these are what we *write* into Aether)
+  // ====================================================================
+
+  function newUuid() {
+    if (window.crypto && crypto.randomUUID) return crypto.randomUUID();
+    // Fallback for older browsers.
+    return 'xxxxxxxxxxxx4xxxyxxxxxxxxxxxxxxx'.replace(/[xy]/g, function (c) {
+      const r = Math.random() * 16 | 0;
+      return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16);
+    });
+  }
+
+  function addNode(type) {
+    const id = newUuid();
+    // Place new nodes near the centre of whatever the user is currently
+    // looking at (the visible portion of the scrollable canvas), with
+    // some jitter so multiple adds don't stack pixel-perfect.
+    const x = canvasWrap.scrollLeft + canvasWrap.clientWidth  / 2
+              + (Math.random() - 0.5) * 60;
+    const y = canvasWrap.scrollTop  + canvasWrap.clientHeight / 2
+              + (Math.random() - 0.5) * 60;
+    aether.set('node:' + id + ':type',   type);
+    aether.set('node:' + id + ':label',  NODE_TYPES[type].defaultName);
+    aether.set('node:' + id + ':coords', { x: Math.round(x), y: Math.round(y) });
+    // Select the new node so the user can immediately tweak it.
+    selectNode(id);
+  }
+
+  function deleteNode(uuid) {
+    // Cascade: remove all incident links first, so peers never observe
+    // dangling links that point to a now-missing endpoint.
+    for (const linkUuid of allLinkUuids()) {
+      const l = readLink(linkUuid);
+      if (l && (l.from === uuid || l.to === uuid)) {
+        aether.delete('link:' + linkUuid);
+      }
+    }
+    aether.delete('node:' + uuid + ':type');
+    aether.delete('node:' + uuid + ':label');
+    aether.delete('node:' + uuid + ':coords');
+    if (selection && selection.kind === 'node' && selection.uuid === uuid) {
+      clearSelection();
+    }
+  }
+
+  function relabelNode(uuid, label) {
+    aether.set('node:' + uuid + ':label', label);
+  }
+
+  function moveNode(uuid, x, y) {
+    // Coalesced via requestAnimationFrame so we never write to Aether
+    // faster than the browser can paint -- caps write rate to display
+    // refresh rate (~60Hz) instead of mousemove rate.
+    pendingWrites.set(uuid, { x: Math.round(x), y: Math.round(y) });
+    if (pendingRAF !== null) return;
+    pendingRAF = requestAnimationFrame(() => {
+      pendingRAF = null;
+      for (const [id, pos] of pendingWrites) {
+        aether.set('node:' + id + ':coords', pos);
+      }
+      pendingWrites.clear();
+    });
+  }
+
+  function createLink(fromUuid, toUuid) {
+    if (fromUuid === toUuid) return;
+    // Reject duplicate links between the same ordered pair. (Multi-graphs
+    // could be supported by removing this check.)
+    for (const id of allLinkUuids()) {
+      const l = readLink(id);
+      if (l && ((l.from === fromUuid && l.to === toUuid)
+             || (l.from === toUuid   && l.to === fromUuid))) {
+        return;
+      }
+    }
+    const id = newUuid();
+    aether.set('link:' + id, {
+      from:  fromUuid,
+      to:    toUuid,
+      speed: DEFAULT_SPEED,
+    });
+    selectLink(id);
+  }
+
+  function deleteLink(uuid) {
+    aether.delete('link:' + uuid);
+    if (selection && selection.kind === 'link' && selection.uuid === uuid) {
+      clearSelection();
+    }
+  }
+
+  function setLinkSpeed(uuid, speed) {
+    const cur = readLink(uuid);
+    if (!cur) return;
+    aether.set('link:' + uuid, { from: cur.from, to: cur.to, speed });
+  }
+
+  // ====================================================================
+  // Rendering -- nodes
+  // ====================================================================
+
+  function syncNode(uuid) {
+    const data = readNode(uuid);
+    let entry = nodeEls.get(uuid);
+
+    if (!data) {
+      // Node has been deleted (tombstoned). Drop the DOM element and
+      // any links that referenced it.
+      if (entry) {
+        entry.root.remove();
+        nodeEls.delete(uuid);
+      }
+      return;
+    }
+
+    if (!entry) {
+      entry = createNodeElement(uuid);
+      nodeEls.set(uuid, entry);
+      nodesLayer.appendChild(entry.root);
+    }
+
+    // Update type-driven visuals.
+    if (entry.root.dataset.type !== data.type) {
+      entry.root.dataset.type = data.type;
+      entry.iconWrap.innerHTML = ICONS[data.type] || '';
+      entry.typeEl.textContent = NODE_TYPES[data.type].label;
+    }
+
+    // Update label.
+    if (entry.labelEl.textContent !== data.label) {
+      entry.labelEl.textContent = data.label;
+    }
+
+    // Update position. If THIS tab is currently dragging this node, the
+    // visual position is being driven directly by mouse events; we don't
+    // want incoming echoes (or competing peer writes) to fight the user.
+    if (!dragging || dragging.uuid !== uuid) {
+      entry.root.style.left = data.x + 'px';
+      entry.root.style.top  = data.y + 'px';
+    }
+  }
+
+  function createNodeElement(uuid) {
+    const root      = document.createElement('div');
+    const body      = document.createElement('div');
+    const iconWrap  = document.createElement('div');
+    const labelEl   = document.createElement('div');
+    const typeEl    = document.createElement('div');
+
+    root.className     = 'node';
+    body.className     = 'node-body';
+    iconWrap.className = 'node-icon-wrap';
+    labelEl.className  = 'node-label';
+    typeEl.className   = 'node-type';
+
+    body.appendChild(iconWrap);
+    body.appendChild(labelEl);
+    body.appendChild(typeEl);
+    root.appendChild(body);
+
+    // Mouse interactions: select on click, drag on hold.
+    body.addEventListener('mousedown', e => onNodeMouseDown(uuid, e));
+    body.addEventListener('click',     e => onNodeClick(uuid, e));
+
+    return { root, body, iconWrap, labelEl, typeEl };
+  }
+
+  // ====================================================================
+  // Rendering -- links
+  // ====================================================================
+
+  function syncLink(uuid) {
+    const data = readLink(uuid);
+    let entry = linkEls.get(uuid);
+
+    // A link is renderable only if both endpoints still exist.
+    const valid = data
+               && readNode(data.from)
+               && readNode(data.to);
+
+    if (!valid) {
+      if (entry) {
+        entry.hit.remove();
+        entry.line.remove();
+        entry.label.remove();
+        linkEls.delete(uuid);
+      }
+      return;
+    }
+
+    if (!entry) {
+      entry = createLinkElement(uuid);
+      linkEls.set(uuid, entry);
+    }
+    updateLinkGeometry(uuid);
+  }
+
+  function createLinkElement(uuid) {
+    // Three SVG nodes per link: the visible line, an invisible thicker
+    // line for easier click targeting, and a text label at the midpoint.
+    const hit   = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+    const line  = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+    const label = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+    hit.setAttribute('class', 'link-hit');
+    line.setAttribute('class', 'link-line');
+    label.setAttribute('class', 'link-label');
+    label.setAttribute('text-anchor', 'middle');
+    label.setAttribute('dominant-baseline', 'central');
+
+    // Click hit on either the visible line OR the invisible hit line.
+    const onClick = e => { e.stopPropagation(); selectLink(uuid); };
+    hit.addEventListener('click', onClick);
+    line.addEventListener('click', onClick);
+
+    linksLayer.appendChild(hit);
+    linksLayer.appendChild(line);
+    linksLayer.appendChild(label);
+    return { hit, line, label };
+  }
+
+  function updateLinkGeometry(uuid) {
+    const entry = linkEls.get(uuid);
+    const data  = readLink(uuid);
+    if (!entry || !data) return;
+    const a = readNode(data.from);
+    const b = readNode(data.to);
+    if (!a || !b) return;
+    for (const el of [entry.hit, entry.line]) {
+      el.setAttribute('x1', a.x); el.setAttribute('y1', a.y);
+      el.setAttribute('x2', b.x); el.setAttribute('y2', b.y);
+    }
+    entry.label.setAttribute('x', (a.x + b.x) / 2);
+    entry.label.setAttribute('y', (a.y + b.y) / 2);
+    entry.label.textContent = data.speed;
+    entry.line.classList.toggle('selected',
+      selection && selection.kind === 'link' && selection.uuid === uuid);
+  }
+
+  function updateLinksReferencing(nodeUuid) {
+    for (const linkUuid of linkEls.keys()) {
+      const l = readLink(linkUuid);
+      if (l && (l.from === nodeUuid || l.to === nodeUuid)) {
+        updateLinkGeometry(linkUuid);
+      }
+    }
+  }
+
+  // ====================================================================
+  // Selection + properties panel
+  // ====================================================================
+
+  function selectNode(uuid) {
+    selection = { kind: 'node', uuid };
+    refreshSelectionDecorations();
+    renderProperties();
+  }
+  function selectLink(uuid) {
+    selection = { kind: 'link', uuid };
+    refreshSelectionDecorations();
+    renderProperties();
+  }
+  function clearSelection() {
+    selection = null;
+    refreshSelectionDecorations();
+    renderProperties();
+  }
+  function refreshSelectionDecorations() {
+    // Reset all .selected classes, then re-apply to current selection.
+    for (const [id, entry] of nodeEls) {
+      entry.root.classList.toggle('selected',
+        selection && selection.kind === 'node' && selection.uuid === id);
+    }
+    for (const [id, entry] of linkEls) {
+      entry.line.classList.toggle('selected',
+        selection && selection.kind === 'link' && selection.uuid === id);
+    }
+  }
+
+  function renderProperties() {
+    if (!selection) {
+      propsPanel.innerHTML = '<div class="props-empty">Nothing selected.</div>';
+      return;
+    }
+    if (selection.kind === 'node') return renderNodeProperties(selection.uuid);
+    if (selection.kind === 'link') return renderLinkProperties(selection.uuid);
+  }
+
+  function renderNodeProperties(uuid) {
+    const n = readNode(uuid);
+    if (!n) { clearSelection(); return; }
+    propsPanel.innerHTML = '';
+
+    const header = document.createElement('div');
+    header.className = 'props-header';
+    header.innerHTML =
+      '<div class="props-icon" data-type="' + n.type + '">' + (ICONS[n.type] || '') + '</div>' +
+      '<div>' +
+        '<div class="props-title">' + escapeHtml(n.label) + '</div>' +
+        '<div class="props-sub">' + NODE_TYPES[n.type].label + '</div>' +
+      '</div>';
+    propsPanel.appendChild(header);
+
+    // Label field.
+    const labelField = field('Label');
+    const labelInput = document.createElement('input');
+    labelInput.type = 'text';
+    labelInput.value = n.label;
+    labelInput.addEventListener('input', () => relabelNode(uuid, labelInput.value));
+    // When the user is done typing, do the panel refresh we skipped
+    // during typing so the header (props-title) catches up to the
+    // current label.
+    labelInput.addEventListener('blur', () => {
+      if (selection && selection.kind === 'node' && selection.uuid === uuid) {
+        renderNodeProperties(uuid);
+      }
+    });
+    labelField.appendChild(labelInput);
+    propsPanel.appendChild(labelField);
+
+    // Coords (read-only display).
+    const coordsField = field('Position');
+    const ro = document.createElement('div');
+    ro.className = 'readonly';
+    ro.textContent = 'x: ' + Math.round(n.x) + '  ·  y: ' + Math.round(n.y);
+    coordsField.appendChild(ro);
+    propsPanel.appendChild(coordsField);
+
+    // UUID (read-only display).
+    const uuidField = field('Aether key prefix');
+    const uuidRo = document.createElement('div');
+    uuidRo.className = 'readonly';
+    uuidRo.textContent = 'node:' + uuid + ':*';
+    uuidField.appendChild(uuidRo);
+    propsPanel.appendChild(uuidField);
+
+    // Actions.
+    const actions = document.createElement('div');
+    actions.className = 'props-actions';
+    const btnConnect = document.createElement('button');
+    btnConnect.className = 'btn primary';
+    btnConnect.textContent = connectingFrom === uuid ? 'Cancel connect' : 'Connect';
+    btnConnect.addEventListener('click', () => {
+      if (connectingFrom === uuid) exitConnectMode();
+      else                          enterConnectMode(uuid);
+    });
+    const btnDelete = document.createElement('button');
+    btnDelete.className = 'btn danger';
+    btnDelete.textContent = 'Delete';
+    btnDelete.addEventListener('click', () => deleteNode(uuid));
+    actions.appendChild(btnConnect);
+    actions.appendChild(btnDelete);
+    propsPanel.appendChild(actions);
+  }
+
+  function renderLinkProperties(uuid) {
+    const l = readLink(uuid);
+    const a = l && readNode(l.from);
+    const b = l && readNode(l.to);
+    if (!l || !a || !b) { clearSelection(); return; }
+
+    propsPanel.innerHTML = '';
+
+    const header = document.createElement('div');
+    header.className = 'props-header';
+    header.innerHTML =
+      '<div class="props-icon">' +
+        '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" stroke-linecap="round">' +
+          '<circle cx="6" cy="6" r="2.5"/><circle cx="18" cy="18" r="2.5"/>' +
+          '<line x1="7.7" y1="7.7" x2="16.3" y2="16.3"/>' +
+        '</svg>' +
+      '</div>' +
+      '<div>' +
+        '<div class="props-title">Link</div>' +
+        '<div class="props-sub">' + l.speed + ' connection</div>' +
+      '</div>';
+    propsPanel.appendChild(header);
+
+    const fromField = field('From');
+    const fromRo = document.createElement('div');
+    fromRo.className = 'readonly';
+    fromRo.textContent = a.label + ' (' + NODE_TYPES[a.type].label + ')';
+    fromField.appendChild(fromRo);
+    propsPanel.appendChild(fromField);
+
+    const toField = field('To');
+    const toRo = document.createElement('div');
+    toRo.className = 'readonly';
+    toRo.textContent = b.label + ' (' + NODE_TYPES[b.type].label + ')';
+    toField.appendChild(toRo);
+    propsPanel.appendChild(toField);
+
+    const speedField = field('Speed');
+    const sel = document.createElement('select');
+    for (const opt of LINK_SPEEDS) {
+      const o = document.createElement('option');
+      o.value = opt; o.textContent = opt;
+      if (opt === l.speed) o.selected = true;
+      sel.appendChild(o);
+    }
+    sel.addEventListener('change', () => setLinkSpeed(uuid, sel.value));
+    speedField.appendChild(sel);
+    propsPanel.appendChild(speedField);
+
+    const keyField = field('Aether key');
+    const keyRo = document.createElement('div');
+    keyRo.className = 'readonly';
+    keyRo.textContent = 'link:' + uuid;
+    keyField.appendChild(keyRo);
+    propsPanel.appendChild(keyField);
+
+    const actions = document.createElement('div');
+    actions.className = 'props-actions';
+    const del = document.createElement('button');
+    del.className = 'btn danger';
+    del.textContent = 'Delete link';
+    del.addEventListener('click', () => deleteLink(uuid));
+    actions.appendChild(del);
+    propsPanel.appendChild(actions);
+  }
+
+  function field(labelText) {
+    const wrap = document.createElement('div');
+    wrap.className = 'props-field';
+    const lab = document.createElement('label');
+    lab.textContent = labelText;
+    wrap.appendChild(lab);
+    return wrap;
+  }
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, c => (
+      { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+    ));
+  }
+
+  // ====================================================================
+  // Connect mode (rubber-band linking)
+  // ====================================================================
+
+  function enterConnectMode(fromUuid) {
+    connectingFrom = fromUuid;
+    connectHintEl.hidden = false;
+    nodesLayer.style.cursor = 'crosshair';
+    // Pulse every node except the source to advertise valid targets.
+    for (const [id, entry] of nodeEls) {
+      entry.root.classList.toggle('connect-target', id !== fromUuid);
+    }
+    renderProperties();   // re-render Connect button label
+  }
+  function exitConnectMode() {
+    connectingFrom = null;
+    connectHintEl.hidden = true;
+    nodesLayer.style.cursor = '';
+    for (const entry of nodeEls.values()) {
+      entry.root.classList.remove('connect-target');
+    }
+    rubberBand.style.display = 'none';
+    renderProperties();
+  }
+  function updateRubberBand(toX, toY) {
+    if (!connectingFrom) { rubberBand.style.display = 'none'; return; }
+    const a = readNode(connectingFrom);
+    if (!a) { rubberBand.style.display = 'none'; return; }
+    rubberBand.style.display = '';
+    rubberBand.setAttribute('x1', a.x);
+    rubberBand.setAttribute('y1', a.y);
+    rubberBand.setAttribute('x2', toX);
+    rubberBand.setAttribute('y2', toY);
+  }
+
+  // ====================================================================
+  // Mouse interactions on nodes
+  // ====================================================================
+
+  function pointToCanvas(evt) {
+    // Convert viewport coords into canvas-local coords accounting for
+    // the canvas-wrap's scroll offset.
+    const rect = canvasInner.getBoundingClientRect();
+    return {
+      x: evt.clientX - rect.left,
+      y: evt.clientY - rect.top,
+    };
+  }
+
+  function onNodeMouseDown(uuid, e) {
+    if (e.button !== 0) return;   // left-button only
+    if (connectingFrom) {
+      // In connect mode, mousedown on a target is the second click; the
+      // 'click' handler will do the actual link creation. Don't begin a
+      // drag here.
+      return;
+    }
+    const n = readNode(uuid);
+    if (!n) return;
+    const p = pointToCanvas(e);
+    dragging = {
+      uuid,
+      dx: p.x - n.x,
+      dy: p.y - n.y,
+      lastX: n.x,
+      lastY: n.y,
+      moved: false,
+    };
+    const entry = nodeEls.get(uuid);
+    if (entry) entry.root.classList.add('dragging');
+    document.addEventListener('mousemove', onDocMouseMove);
+    document.addEventListener('mouseup',   onDocMouseUp, { once: true });
+    e.preventDefault();
+  }
+
+  function onNodeClick(uuid, e) {
+    e.stopPropagation();
+    if (connectingFrom) {
+      if (connectingFrom !== uuid) {
+        createLink(connectingFrom, uuid);
+      }
+      exitConnectMode();
+      return;
+    }
+    // Plain click after a drag should NOT toggle selection; only true
+    // clicks (no movement) select.
+    if (dragging && dragging.moved) return;
+    selectNode(uuid);
+  }
+
+  function onDocMouseMove(e) {
+    const p = pointToCanvas(e);
+    if (dragging) {
+      const x = Math.max(0, Math.min(CANVAS_W, p.x - dragging.dx));
+      const y = Math.max(0, Math.min(CANVAS_H, p.y - dragging.dy));
+      if (Math.abs(x - dragging.lastX) > 0.5 || Math.abs(y - dragging.lastY) > 0.5) {
+        dragging.moved = true;
+        dragging.lastX = x; dragging.lastY = y;
+        // Update local DOM immediately so the drag feels native.
+        const entry = nodeEls.get(dragging.uuid);
+        if (entry) {
+          entry.root.style.left = x + 'px';
+          entry.root.style.top  = y + 'px';
+        }
+        // Update incident links live.
+        updateLinksReferencing(dragging.uuid);
+        // Coalesced write to aether (gossiped + persisted).
+        moveNode(dragging.uuid, x, y);
+        // Refresh the coords readout in the properties panel.
+        if (selection && selection.kind === 'node' && selection.uuid === dragging.uuid
+            && !propsPanelHasFocus()) {
+          renderNodeProperties(dragging.uuid);
+        }
+      }
+    }
+    if (connectingFrom) {
+      updateRubberBand(p.x, p.y);
+    }
+  }
+  function onDocMouseUp() {
+    document.removeEventListener('mousemove', onDocMouseMove);
+    if (dragging) {
+      const entry = nodeEls.get(dragging.uuid);
+      if (entry) entry.root.classList.remove('dragging');
+      // Flush any pending coalesced write immediately so the final
+      // resting position is recorded without waiting for the next frame.
+      if (pendingRAF !== null) {
+        cancelAnimationFrame(pendingRAF);
+        pendingRAF = null;
+        for (const [id, pos] of pendingWrites) {
+          aether.set('node:' + id + ':coords', pos);
+        }
+        pendingWrites.clear();
+      }
+      dragging = null;
+    }
+  }
+
+  // ====================================================================
+  // Aether state change handler
+  // ====================================================================
+
+  aether.onStatus(connected => {
+    statusEl.classList.toggle('connected', connected);
+    statusTextEl.textContent = connected
+      ? 'connected · ' + gatewayUrl()
+      : 'disconnected · retrying…';
+  });
+
+  aether.onAny((key /*, newValue, oldValue */) => {
+    // Pattern-match the key to the relevant entity, then re-sync just
+    // that entity. Cheap because syncNode/syncLink are O(1) DOM ops.
+    let m;
+    if ((m = key.match(/^node:([^:]+):(type|label|coords)$/))) {
+      const uuid = m[1];
+      syncNode(uuid);
+      // Coord changes might displace lines drawn to/from this node.
+      if (m[2] === 'coords' || m[2] === 'type') {
+        updateLinksReferencing(uuid);
+      }
+      // The properties panel might be showing this node. Re-render
+      // ONLY if no input/select inside the panel currently has focus.
+      // Rebuilding while the user is typing destroys the live input
+      // element, ejects focus to <body>, and turns the next Backspace
+      // into a node-delete shortcut. Skipping the rebuild is safe: the
+      // input already shows the user's typed value (they just typed it).
+      if (selection && selection.kind === 'node' && selection.uuid === uuid
+          && !propsPanelHasFocus()) {
+        renderNodeProperties(uuid);
+      }
+    } else if ((m = key.match(/^link:([^:]+)$/))) {
+      syncLink(m[1]);
+      if (selection && selection.kind === 'link' && selection.uuid === m[1]
+          && !propsPanelHasFocus()) {
+        renderLinkProperties(m[1]);
+      }
+    }
+    refreshCounts();
+    refreshEmptyState();
+  });
+
+  function propsPanelHasFocus() {
+    const a = document.activeElement;
+    return !!(a && propsPanel.contains(a) && isTypingTarget(a));
+  }
+
+  function initialRender() {
+    for (const uuid of allNodeUuids()) syncNode(uuid);
+    for (const uuid of allLinkUuids()) syncLink(uuid);
+    refreshCounts();
+    refreshEmptyState();
+  }
+
+  function refreshCounts() {
+    const nodes = nodeEls.size, links = linkEls.size;
+    countsEl.textContent =
+      nodes + ' device' + (nodes === 1 ? '' : 's') + ' · ' +
+      links + ' link'   + (links === 1 ? '' : 's');
+  }
+  function refreshEmptyState() {
+    emptyState.style.display = nodeEls.size === 0 ? '' : 'none';
+  }
+
+  // ====================================================================
+  // Global event listeners
+  // ====================================================================
+
+  // Palette: add a device.
+  document.querySelectorAll('.palette-btn').forEach(btn => {
+    btn.addEventListener('click', () => addNode(btn.dataset.type));
+  });
+
+  // Click on empty canvas: deselect / cancel connect.
+  canvasInner.addEventListener('click', e => {
+    if (e.target.closest('.node')) return;  // node handled its own click
+    if (e.target.closest('.link-line') || e.target.closest('.link-hit')) return;
+    if (connectingFrom) { exitConnectMode(); return; }
+    clearSelection();
+  });
+
+  // Mouse move on canvas drives the rubber band even when not over a node.
+  canvasInner.addEventListener('mousemove', e => {
+    if (connectingFrom && !dragging) {
+      const p = pointToCanvas(e);
+      updateRubberBand(p.x, p.y);
+    }
+  });
+
+  // Keyboard.
+  function isTypingTarget(el) {
+    if (!el) return false;
+    const tag = el.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return true;
+    if (el.isContentEditable) return true;
+    return false;
+  }
+  document.addEventListener('keydown', e => {
+    // Don't intercept while the user is interacting with any text/select
+    // input -- check BOTH the event target and document.activeElement.
+    // The activeElement check is critical: if a previous render had
+    // momentarily replaced the focused input (focus then reverts to
+    // document.body), e.target would be body but the user clearly meant
+    // to keep typing. Checking activeElement closes that gap.
+    if (isTypingTarget(e.target) || isTypingTarget(document.activeElement)) {
+      if (e.key === 'Escape') {
+        if (e.target && e.target.blur) e.target.blur();
+        if (document.activeElement && document.activeElement.blur) document.activeElement.blur();
+      }
+      return;
+    }
+    if (e.key === 'Escape') {
+      if (connectingFrom) exitConnectMode();
+      else                clearSelection();
+    } else if (e.key === 'Delete' || e.key === 'Backspace') {
+      if (!selection) return;
+      if (selection.kind === 'node') deleteNode(selection.uuid);
+      else                            deleteLink(selection.uuid);
+      e.preventDefault();
+    }
+  });
+
+  // ====================================================================
+  // Bootstrap
+  // ====================================================================
+
+  aether.ready().then(initialRender);
+
+  // Centre the scroll viewport on the canvas so newly-added nodes land
+  // in the middle of the visible area on first load.
+  window.addEventListener('load', () => {
+    canvasWrap.scrollLeft = (CANVAS_W - canvasWrap.clientWidth)  / 2;
+    canvasWrap.scrollTop  = (CANVAS_H - canvasWrap.clientHeight) / 2;
+  });
+})();
+</script>
+</body>
+</html>
