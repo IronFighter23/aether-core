@@ -25,9 +25,10 @@ A five-layer architecture, each layer built on the one below it:
 |------:|:-------|:---------------|
 | 1 | `crdt.py` | Hybrid Logical Clock, LWW Register, LWW Map — the deterministic-convergence math |
 | 2 | `mesh.py` | P2P WebSocket gossip with epidemic relay and HLC-based deduplication |
-| 3 | `storage.py` | Append-only JSONL event ledger with crash-resilient replay |
+| 3 | `storage.py` | Append-only JSONL event ledger with crash-resilient replay and snapshot-aware boot |
 | 4 | `gateway.py` | Browser-facing WebSocket bridge plus a vanilla JS SDK (`web/aether.js`) |
 | 5 | `web/index.html` | A real application built on the stack: a collaborative network-topology whiteboard |
+| 6 | `compact.py` | Offline log compaction worker — folds the ledger into a snapshot for fast boots |
 
 Each layer ships with a runnable self-test that proves its invariants in
 isolation; the full stack ships with a launcher that wires everything together.
@@ -244,6 +245,53 @@ No frameworks. No build step. ~1,300 lines of pure HTML + CSS + vanilla JS.
 
 ---
 
+## Phase 6 :: Log compaction (`aether_core/compact.py`)
+
+The append-only ledger grows forever — every `set` and `delete` is a new
+line. After tens of thousands of operations, boot-time replay slows
+down. `compact.py` is an offline worker that folds the ledger into a
+condensed `<ledger>.snapshot.json` containing the final value (or
+tombstone) for each key, plus the HLC stamp that produced it.
+
+```bash
+# Stop the server first (compaction is offline-only)
+python -m aether_core.compact ledger_demo.jsonl
+
+# Optional: archive the ledger and start fresh after a known-good snapshot
+python -m aether_core.compact ledger_demo.jsonl --rotate
+```
+
+Output:
+
+```
+Compacting ledger: ledger_demo.jsonl
+  records read    : 1,247
+  live keys       : 89
+  tombstones      : 14
+  max stamp       : 01782311939892269105.0000000000.alpha
+  snapshot        : ledger_demo.jsonl.snapshot.json
+  snapshot size   : 12,830 bytes
+done.
+```
+
+**Boot integration.** `ChronoLedger.boot()` auto-detects
+`<ledger>.snapshot.json`. If present, it loads each entry into the CRDT
+first and then replays only ledger records with HLC stamps strictly
+newer than the snapshot's `max_stamp`. Boot time becomes
+O(records-since-last-compact) instead of O(records-ever-written).
+
+**Atomicity.** The snapshot is written to a `.tmp` file, fsync'd, and
+then atomically renamed over the final path. A process crash mid-write
+leaves any prior snapshot intact.
+
+**Rotation.** With `--rotate`, the original ledger is moved to
+`<ledger>.archived.<unix-ts>` (never deleted — recoverable if the
+snapshot turns out to be flawed), and a fresh empty ledger replaces it.
+
+Run the self-test:
+
+`python -m aether_core.compact`
+
 ## Project layout
 
 ```
@@ -252,8 +300,9 @@ aether-core/
 │   ├── __init__.py       (re-exports the public API)
 │   ├── crdt.py           Phase 1 — math
 │   ├── mesh.py           Phase 2 — networking
-│   ├── storage.py        Phase 3 — persistence
-│   └── gateway.py        Phase 4 — browser bridge
+│   ├── storage.py        Phase 3 — persistence (snapshot-aware)
+│   ├── gateway.py        Phase 4 — browser bridge
+│   └── compact.py        Phase 6 — log compaction worker
 ├── web/                  Browser-facing assets
 │   ├── aether.js         Phase 4 — vanilla JS SDK
 │   └── index.html        Phase 5 — topology whiteboard
@@ -276,6 +325,7 @@ python -m aether_core.crdt       # CRDT convergence
 python -m aether_core.mesh       # mesh sync (linear topology)
 python -m aether_core.storage    # ledger persistence + crash recovery
 python -m aether_core.gateway    # gateway + simulated browser sync
+python -m aether_core.compact    # log compaction + snapshot boot
 ```
 
 All four exit 0 on success.
@@ -296,17 +346,19 @@ All four exit 0 on success.
 
 ## Project status
 
-Phases 1–5 are complete and verified. Natural next milestones, in roughly
+Phases 1–6 are complete and verified. Natural next milestones, in roughly
 this order:
 
 * **Anti-entropy resync** — after a network partition heals, peers should
   exchange Merkle digests of their oplogs and patch up the gaps without
   re-gossiping the entire history.
-* **Ledger compaction** — once an operation has been observed by every peer
-  in the cluster, its tombstones can be folded into a snapshot prefix.
 * **Range queries / indexes** — secondary structures over the LWW Map so
   apps can ask "all node:* keys" without scanning the whole snapshot. This
   is currently done client-side and is fine up to a few thousand keys.
+* **Multi-region deployment** — the mesh layer is already P2P; a real
+  deployment across continents just needs each region to run its own
+  MeshNode peered with the others, with the existing CRDT layer handling
+  reconciliation.
 
 ---
 

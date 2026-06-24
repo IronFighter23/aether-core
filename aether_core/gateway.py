@@ -29,8 +29,10 @@ state.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
+import uuid
 from typing import Any, Awaitable, Callable, Iterable, Optional
 
 from websockets import serve
@@ -69,6 +71,18 @@ def compose_hooks(
     return composed
 
 
+def _color_for(client_id: str) -> str:
+    """
+    Deterministically derive a vibrant HSL colour string from a client id.
+    Same client always gets the same colour across reconnects. Wide hue
+    spread + fixed saturation/lightness keeps cursors readable on the
+    dark canvas regardless of which colours adjacent peers happen to get.
+    """
+    h = int(hashlib.sha1(client_id.encode("utf-8")).hexdigest()[:6], 16)
+    hue = h % 360
+    return f"hsl({hue}, 78%, 62%)"
+
+
 class ClientGateway:
     """
     WebSocket endpoint for thin browser clients.
@@ -77,7 +91,12 @@ class ClientGateway:
     in to the mesh's ``on_op`` stream via ``compose_hooks``.
     """
 
-    __slots__ = ("_mesh", "_host", "_port", "_clients", "_server", "_lock", "_closed")
+    __slots__ = (
+        "_mesh", "_host", "_port",
+        "_clients",         # set of live WebSocket connections
+        "_client_index",    # ws -> {"id": str, "color": str}
+        "_server", "_lock", "_closed",
+    )
 
     def __init__(
         self,
@@ -88,7 +107,12 @@ class ClientGateway:
         self._mesh = mesh_node
         self._host = host
         self._port = port
+        # Live browser sessions, tracked as a set of WebSockets.
         self._clients: set[Any] = set()
+        # Per-client metadata for presence (cursor) broadcasts.
+        # Cursor positions live ONLY in memory and in transit -- never
+        # in the CRDT, never in the ledger.
+        self._client_index: dict[Any, dict[str, str]] = {}
         self._server: Optional[Any] = None
         self._lock = asyncio.Lock()
         self._closed = False
@@ -172,38 +196,54 @@ class ClientGateway:
     # -- browser session ----------------------------------------------------
 
     async def _handle_client(self, ws: Any) -> None:
+        # Mint a stable, server-side identity for this browser session.
+        client_id = str(uuid.uuid4())
+        color     = _color_for(client_id)
         async with self._lock:
             self._clients.add(ws)
-        client_id = id(ws)
+            self._client_index[ws] = {"id": client_id, "color": color}
         logger.info("[gateway] client %s connected (total=%d)",
-                    client_id, len(self._clients))
+                    client_id[:8], len(self._clients))
 
         try:
-            # 1. Push the current state snapshot so the browser starts
-            #    in sync with whatever already exists in the mesh.
+            # 1. Tell the client its own identity. Used so the browser
+            #    can ignore its own cursor echoes and label itself.
+            await ws.send(json.dumps({
+                "type":  "hello",
+                "id":    client_id,
+                "color": color,
+            }, separators=(",", ":")))
+
+            # 2. Push the current durable state snapshot.
             snapshot = self._mesh.snapshot()
             await ws.send(json.dumps(
                 {"type": "snapshot", "data": snapshot},
                 separators=(",", ":"),
             ))
 
-            # 2. Accept mutation messages. Anything malformed is
-            #    silently dropped -- the gateway is a public endpoint
-            #    and must not crash on bad input.
+            # 3. Accept inbound messages (set/delete/presence). Anything
+            #    malformed is silently dropped -- the gateway is a
+            #    public endpoint and must not crash on bad input.
             async for raw in ws:
-                await self._handle_client_message(raw)
+                await self._handle_client_message(raw, ws)
 
         except ConnectionClosed:
             pass
         except Exception:  # noqa: BLE001
-            logger.exception("[gateway] client %s handler crashed", client_id)
+            logger.exception("[gateway] client %s handler crashed", client_id[:8])
         finally:
             async with self._lock:
                 self._clients.discard(ws)
+                self._client_index.pop(ws, None)
             logger.info("[gateway] client %s disconnected (total=%d)",
-                        client_id, len(self._clients))
+                        client_id[:8], len(self._clients))
+            # Tell remaining peers this cursor is gone so they can fade
+            # it out instead of leaving a stale dot on the canvas.
+            await self._announce_leave(client_id)
 
-    async def _handle_client_message(self, raw: str | bytes) -> None:
+    async def _handle_client_message(
+        self, raw: str | bytes, sender_ws: Any,
+    ) -> None:
         try:
             msg = json.loads(raw)
         except (json.JSONDecodeError, TypeError):
@@ -212,10 +252,16 @@ class ClientGateway:
             return
 
         mtype = msg.get("type")
+
+        # ── Ephemeral presence (cursor) -- relay only, never persisted ──
+        if mtype == "presence":
+            await self._relay_presence(sender_ws, msg)
+            return
+
+        # ── Durable mutations -- go through the CRDT + ledger ──
         key = msg.get("key")
         if not isinstance(key, str) or not key:
             return
-
         if mtype == "set":
             # Value can be any JSON-encodable thing the browser sent.
             # The CRDT layer is type-agnostic.
@@ -224,6 +270,55 @@ class ClientGateway:
             await self._mesh.delete(key)
         # Unknown types: ignore. Forward-compat with future protocol
         # extensions (subscriptions, range queries, etc.).
+
+    async def _relay_presence(self, sender_ws: Any, msg: dict[str, Any]) -> None:
+        """
+        Relay an ephemeral cursor update to every OTHER connected client.
+        This path deliberately bypasses the mesh and the ledger -- cursor
+        coordinates have no business in the durable event log.
+        """
+        meta = self._client_index.get(sender_ws)
+        if not meta:
+            return
+        # Coerce + clamp to ints so we don't waste bytes on float jitter.
+        try:
+            x = int(msg.get("x", 0))
+            y = int(msg.get("y", 0))
+        except (TypeError, ValueError):
+            return
+        outbound = json.dumps({
+            "type":  "presence",
+            "id":    meta["id"],
+            "color": meta["color"],
+            "x":     x,
+            "y":     y,
+        }, separators=(",", ":"))
+
+        async with self._lock:
+            peers = [ws for ws in self._clients if ws is not sender_ws]
+        if not peers:
+            return
+        await asyncio.gather(
+            *[self._safe_send(ws, outbound) for ws in peers],
+            return_exceptions=True,
+        )
+
+    async def _announce_leave(self, client_id: str) -> None:
+        """Broadcast a presence-leave so peers can remove this cursor."""
+        if self._closed:
+            return
+        outbound = json.dumps(
+            {"type": "presence-leave", "id": client_id},
+            separators=(",", ":"),
+        )
+        async with self._lock:
+            peers = list(self._clients)
+        if not peers:
+            return
+        await asyncio.gather(
+            *[self._safe_send(ws, outbound) for ws in peers],
+            return_exceptions=True,
+        )
 
     async def _safe_send(self, ws: Any, message: str) -> None:
         try:

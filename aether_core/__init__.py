@@ -22,6 +22,7 @@ from aether_core.mesh import (
 )
 from aether_core.storage import ChronoLedger
 from aether_core.gateway import ClientGateway, compose_hooks
+from aether_core.compact import compact, load_snapshot, snapshot_path_for
 
 __all__ = [
     "HybridLogicalClock",
@@ -39,4 +40,7 @@ __all__ = [
     "ChronoLedger",
     "ClientGateway",
     "compose_hooks",
+    "compact",
+    "load_snapshot",
+    "snapshot_path_for",
 ]

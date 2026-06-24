@@ -33,7 +33,7 @@ import os
 from pathlib import Path
 from typing import Any, Optional
 
-from aether_core.crdt import Operation
+from aether_core.crdt import HybridLogicalClock, OpKind, Operation
 from aether_core.mesh import MeshNode, deserialize_operation, serialize_operation
 
 __all__ = ["ChronoLedger"]
@@ -69,6 +69,8 @@ class ChronoLedger:
         "_replayed_count",
         "_written_count",
         "_truncated_bytes",
+        "_snapshot_entries",
+        "_snapshot_skipped",
     )
 
     def __init__(self, path: str | os.PathLike[str]) -> None:
@@ -81,6 +83,10 @@ class ChronoLedger:
         self._replayed_count = 0
         self._written_count = 0
         self._truncated_bytes = 0
+        # Phase 4 stats: entries loaded from snapshot, ledger ops skipped
+        # because they were already covered by the snapshot's max_stamp.
+        self._snapshot_entries = 0
+        self._snapshot_skipped = 0
 
     # -- introspection ------------------------------------------------------
 
@@ -102,6 +108,16 @@ class ChronoLedger:
     def truncated_bytes(self) -> int:
         """Bytes discarded as a torn final record during boot recovery."""
         return self._truncated_bytes
+
+    @property
+    def snapshot_entries(self) -> int:
+        """Entries loaded from a snapshot file at boot (Phase 4)."""
+        return self._snapshot_entries
+
+    @property
+    def snapshot_skipped(self) -> int:
+        """Ledger ops skipped because the snapshot already covered them."""
+        return self._snapshot_skipped
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -188,11 +204,67 @@ class ChronoLedger:
     def _replay_sync(self) -> tuple[int, int]:
         """
         Read every complete record (ending in ``\\n``) and feed it to
-        the CRDT. If the final record is torn, truncate it. Returns
+        the CRDT. If a ``<ledger>.snapshot.json`` exists next to the
+        ledger, load it first and skip any ledger records whose HLC
+        stamp is <= the snapshot's max_stamp (already covered). If the
+        final record is torn, truncate it. Returns
         ``(num_replayed, num_truncated_bytes)``.
         """
         assert self._mesh is not None
 
+        # ── Phase 4: snapshot fast-path ───────────────────────────────
+        # If a snapshot exists next to the ledger, load it before
+        # replaying. Each entry is fed into the CRDT directly so the
+        # store, the HLC generator, and the mesh's seen-set all advance
+        # to the snapshot's frontier. Future ledger records older than
+        # this frontier are no-ops by CRDT semantics and are skipped
+        # outright for speed.
+        snapshot_max_stamp: Optional[HybridLogicalClock] = None
+        try:
+            # Lazy import: keeps storage.py independent of compact.py
+            # at module-import time, and avoids any circular-import
+            # surprises if compact.py grows new dependencies later.
+            from aether_core.compact import load_snapshot, snapshot_path_for
+            snap_path = snapshot_path_for(self._path)
+            if snap_path.exists():
+                entries, snapshot_max_stamp = load_snapshot(snap_path)
+                for e in entries:
+                    if e["tombstone"]:
+                        op: Operation[Any, Any] = Operation(
+                            kind=OpKind.DEL,
+                            key=e["key"],
+                            value=None,
+                            stamp=e["stamp"],
+                        )
+                    else:
+                        op = Operation(
+                            kind=OpKind.SET,
+                            key=e["key"],
+                            value=e["value"],
+                            stamp=e["stamp"],
+                        )
+                    self._mesh.node.receive(op)
+                    self._mesh._seen.add(op.stamp)  # noqa: SLF001
+                    self._snapshot_entries += 1
+                logger.info(
+                    "[ledger %s] loaded snapshot: %d entries, max_stamp=%s",
+                    self._path.name,
+                    self._snapshot_entries,
+                    snapshot_max_stamp.encode() if snapshot_max_stamp else "(empty)",
+                )
+        except Exception as e:  # noqa: BLE001
+            # Snapshot corruption or version mismatch: log it, drop the
+            # max_stamp guard, and fall back to a full ledger replay.
+            # The CRDT layer is idempotent, so any partial state we may
+            # have already applied is harmless.
+            logger.warning(
+                "[ledger %s] snapshot load failed, falling back to full replay: %s",
+                self._path.name, e,
+            )
+            snapshot_max_stamp = None
+            self._snapshot_entries = 0
+
+        # ── Standard ledger replay (now stamp-gated) ──────────────────
         if not self._path.exists():
             return (0, 0)
 
@@ -213,36 +285,31 @@ class ChronoLedger:
                     op = deserialize_operation(payload)
                 except (json.JSONDecodeError, UnicodeDecodeError, KeyError, ValueError, TypeError) as e:
                     # Mid-file corruption: skip this line, keep going.
-                    # We don't truncate here -- subsequent records may
-                    # still be valid and we cannot prove they aren't.
                     logger.warning(
                         "[ledger %s] skipping unparseable record at offset %d: %s",
                         self._path.name, record_start, e,
                     )
                     continue
 
-                # Feed directly into the CRDT; bypass MeshNode._ingest
-                # which would (a) call on_op (re-writing what we just
-                # read) and (b) attempt to broadcast (no peers exist
-                # yet). Populate _seen so post-boot peer gossip dedupes
-                # records we already have on disk.
+                # Phase 4: skip ops the snapshot already encompasses.
+                # `op.stamp <= snapshot_max_stamp` means this op was
+                # already folded into the on-disk snapshot, so applying
+                # it again would be a CRDT no-op -- skip for speed.
+                if snapshot_max_stamp is not None and op.stamp <= snapshot_max_stamp:
+                    self._snapshot_skipped += 1
+                    continue
+
                 self._mesh.node.receive(op)
                 self._mesh._seen.add(op.stamp)  # noqa: SLF001 -- same package
                 replayed += 1
 
         truncated = 0
         if torn_tail:
-            # Recover by truncating to the last complete newline.
             with open(self._path, "r+b") as f:
                 f.seek(0, os.SEEK_END)
                 current_size = f.tell()
                 truncated = current_size - last_good_offset
                 f.truncate(last_good_offset)
-                # fsync directory entry so the truncation survives a
-                # subsequent crash. Best-effort: not all platforms
-                # permit fsync on the data file alone here, but we did
-                # truncate via the file handle so the metadata is
-                # already in flight.
                 try:
                     f.flush()
                     os.fsync(f.fileno())
