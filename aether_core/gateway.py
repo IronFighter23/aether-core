@@ -1,23 +1,38 @@
 """
-Aether-Core :: Client Gateway
-=============================
+Aether-Core :: Client Gateway (browser <-> server only)
+=======================================================
 
-Browsers cannot dial arbitrary TCP peers, and asking every browser tab
-to participate in the peer gossip protocol would also be a waste of
-bandwidth. The ``ClientGateway`` solves both problems: it runs a
-dedicated WebSocket endpoint that browser clients connect to, and acts
-as a single mesh participant on their behalf.
+This module is the **client-facing** half of the Aether-Core server.
+It runs a dedicated WebSocket endpoint that **browser tabs** connect
+to. It does NOT participate in federation; node-to-node traffic is
+handled exclusively by ``aether_core.mesh.MeshPubSub``.
+
+Adapter-pattern separation
+--------------------------
+* ``ClientGateway`` -- browser <-> server (this file)
+* ``MeshPubSub``    -- server <-> server (``aether_core/mesh.py``)
+* ``ChronoLedger``  -- server <-> disk   (``aether_core/storage.py``)
+
+All three subscribe to the same ``MeshNode.on_op`` stream via
+``compose_hooks`` and never reach across each other's boundaries.
 
 Wire protocol (browser <-> gateway)
 -----------------------------------
-Browser -> gateway:
-    {"type": "set",    "key": "<str>", "value": <json>}
-    {"type": "delete", "key": "<str>"}
+Browser -> gateway::
 
-Gateway -> browser:
-    {"type": "snapshot", "data": {"<key>": <json>, ...}}     # sent on connect
-    {"type": "set",      "key": "<str>", "value": <json>}    # propagated mutation
-    {"type": "delete",   "key": "<str>"}                     # propagated tombstone
+    {"type": "set",      "key": "<str>", "value": <json>}
+    {"type": "delete",   "key": "<str>"}
+    {"type": "presence", "x": <int>, "y": <int>}     # ephemeral cursor
+
+Gateway -> browser::
+
+    {"type": "hello",          "id": "<uuid>", "color": "<hsl>"}    # on connect
+    {"type": "snapshot",       "data": {"<key>": <json>, ...}}      # on connect
+    {"type": "set",            "key": "<str>", "value": <json>}     # mutation
+    {"type": "delete",         "key": "<str>"}                      # tombstone
+    {"type": "presence",       "id": "<uuid>", "color": "<hsl>",
+                                "x": <int>, "y": <int>}              # cursor relay
+    {"type": "presence-leave", "id": "<uuid>"}                       # disconnect
 
 The gateway is intentionally "dumb" about CRDT semantics: it converts
 inbound JSON to ``mesh.set/delete`` calls (which generate HLC stamps
@@ -33,7 +48,7 @@ import hashlib
 import json
 import logging
 import uuid
-from typing import Any, Awaitable, Callable, Iterable, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 from websockets import serve
 from websockets.exceptions import ConnectionClosed
@@ -52,12 +67,14 @@ def compose_hooks(
     """
     Fan a single ``on_op`` event out to multiple async subscribers.
 
-    The mesh layer's ``on_op`` is a single callable, but in practice we
-    need both the ChronoLedger (for persistence) and the ClientGateway
-    (for browser push) listening to the same stream. ``compose_hooks``
-    bundles them into one callback that invokes each in declaration
-    order; ``None`` entries are skipped so the helper is also safe to
-    use when some subscribers are optional.
+    The mesh layer's ``on_op`` is a single callable, but in practice
+    we need both the ``ChronoLedger`` (for persistence) and the
+    ``ClientGateway`` (for browser push) listening to the same
+    stream. ``compose_hooks`` bundles them into one callback that
+    invokes each in declaration order; ``None`` entries are skipped
+    so the helper is also safe to use when some subscribers are
+    optional. Exceptions raised by any one hook are logged but do
+    not abort the others.
     """
     real_hooks = [h for h in hooks if h is not None]
 
@@ -73,10 +90,11 @@ def compose_hooks(
 
 def _color_for(client_id: str) -> str:
     """
-    Deterministically derive a vibrant HSL colour string from a client id.
-    Same client always gets the same colour across reconnects. Wide hue
-    spread + fixed saturation/lightness keeps cursors readable on the
-    dark canvas regardless of which colours adjacent peers happen to get.
+    Deterministically derive a vibrant HSL colour string from a client
+    id. Same client always gets the same colour across reconnects.
+    Wide hue spread + fixed saturation/lightness keeps cursors
+    readable on the dark canvas regardless of which colours adjacent
+    peers happen to get.
     """
     h = int(hashlib.sha1(client_id.encode("utf-8")).hexdigest()[:6], 16)
     hue = h % 360
@@ -85,16 +103,19 @@ def _color_for(client_id: str) -> str:
 
 class ClientGateway:
     """
-    WebSocket endpoint for thin browser clients.
+    WebSocket endpoint for **thin browser clients only**.
 
-    Bind to a running ``MeshNode``, expose a port, and wire the gateway
-    in to the mesh's ``on_op`` stream via ``compose_hooks``.
+    Bind to a running ``MeshNode``, expose a port, and wire the
+    gateway into the mesh's ``on_op`` stream via ``compose_hooks``.
+    The gateway never speaks the federation protocol -- if you need
+    to peer with another Python node, configure ``MeshNode``'s
+    ``MeshPubSub`` driver instead.
     """
 
     __slots__ = (
         "_mesh", "_host", "_port",
-        "_clients",         # set of live WebSocket connections
-        "_client_index",    # ws -> {"id": str, "color": str}
+        "_clients",          # set of live WebSocket connections
+        "_client_index",     # ws -> {"id": str, "color": str}
         "_server", "_lock", "_closed",
     )
 
@@ -138,6 +159,10 @@ class ClientGateway:
     # -- lifecycle ----------------------------------------------------------
 
     async def start(self) -> None:
+        if self._closed:
+            raise RuntimeError("gateway already stopped; construct a new one")
+        if self._server is not None:
+            return
         self._server = await serve(self._handle_client, self._host, self._port)
         if self._port == 0:
             for sock in self._server.sockets:
@@ -153,6 +178,7 @@ class ClientGateway:
         async with self._lock:
             clients = list(self._clients)
             self._clients.clear()
+            self._client_index.clear()
         for ws in clients:
             try:
                 await ws.close()
@@ -167,13 +193,15 @@ class ClientGateway:
 
     # -- mesh subscriber ----------------------------------------------------
 
-    async def on_op(self, op: Operation[Any, Any], source_peer: Optional[str]) -> None:
+    async def on_op(
+        self, op: Operation[Any, Any], source_peer: Optional[str],
+    ) -> None:
         """
         Hook for ``MeshNode``'s on_op stream. Fans every operation
         observed by the mesh (local or remote) out to every connected
         browser client. ``source_peer`` is ignored for the browser
-        protocol -- browsers see fully resolved state changes, not raw
-        gossip identities.
+        protocol -- browsers see fully resolved state changes, not
+        raw gossip identities.
         """
         if self._closed:
             return
@@ -183,7 +211,9 @@ class ClientGateway:
             return
 
         if op.kind is OpKind.SET:
-            payload = {"type": "set", "key": op.key, "value": op.value}
+            payload: dict[str, Any] = {
+                "type": "set", "key": op.key, "value": op.value,
+            }
         else:
             payload = {"type": "delete", "key": op.key}
         message = json.dumps(payload, separators=(",", ":"))
@@ -202,8 +232,10 @@ class ClientGateway:
         async with self._lock:
             self._clients.add(ws)
             self._client_index[ws] = {"id": client_id, "color": color}
-        logger.info("[gateway] client %s connected (total=%d)",
-                    client_id[:8], len(self._clients))
+        logger.info(
+            "[gateway] client %s connected (total=%d)",
+            client_id[:8], len(self._clients),
+        )
 
         try:
             # 1. Tell the client its own identity. Used so the browser
@@ -230,52 +262,65 @@ class ClientGateway:
         except ConnectionClosed:
             pass
         except Exception:  # noqa: BLE001
-            logger.exception("[gateway] client %s handler crashed", client_id[:8])
+            logger.exception(
+                "[gateway] client %s handler crashed", client_id[:8],
+            )
         finally:
             async with self._lock:
                 self._clients.discard(ws)
                 self._client_index.pop(ws, None)
-            logger.info("[gateway] client %s disconnected (total=%d)",
-                        client_id[:8], len(self._clients))
-            # Tell remaining peers this cursor is gone so they can fade
-            # it out instead of leaving a stale dot on the canvas.
+            logger.info(
+                "[gateway] client %s disconnected (total=%d)",
+                client_id[:8], len(self._clients),
+            )
+            # Tell remaining peers this cursor is gone so they can
+            # fade it out instead of leaving a stale dot on the canvas.
             await self._announce_leave(client_id)
 
     async def _handle_client_message(
         self, raw: str | bytes, sender_ws: Any,
     ) -> None:
+        # 1. Parse JSON. Bad payload -> drop the message.
         try:
             msg = json.loads(raw)
-        except (json.JSONDecodeError, TypeError):
+        except (json.JSONDecodeError, TypeError, UnicodeDecodeError):
             return
         if not isinstance(msg, dict):
             return
 
         mtype = msg.get("type")
 
-        # ── Ephemeral presence (cursor) -- relay only, never persisted ──
+        # 2. Ephemeral presence (cursor) -- relay only, never persisted.
         if mtype == "presence":
             await self._relay_presence(sender_ws, msg)
             return
 
-        # ── Durable mutations -- go through the CRDT + ledger ──
+        # 3. Durable mutations -- go through the CRDT + ledger.
         key = msg.get("key")
         if not isinstance(key, str) or not key:
             return
-        if mtype == "set":
-            # Value can be any JSON-encodable thing the browser sent.
-            # The CRDT layer is type-agnostic.
-            await self._mesh.set(key, msg.get("value"))
-        elif mtype == "delete":
-            await self._mesh.delete(key)
-        # Unknown types: ignore. Forward-compat with future protocol
-        # extensions (subscriptions, range queries, etc.).
+        try:
+            if mtype == "set":
+                # Value can be any JSON-encodable thing the browser
+                # sent. The CRDT layer is type-agnostic.
+                await self._mesh.set(key, msg.get("value"))
+            elif mtype == "delete":
+                await self._mesh.delete(key)
+            # Unknown types: ignore. Forward-compat with future
+            # protocol extensions (subscriptions, range queries, ...).
+        except Exception:  # noqa: BLE001
+            # A failing mesh write must not bring down the client
+            # connection. Log and continue accepting messages.
+            logger.exception("[gateway] mesh write failed for %r", key)
 
-    async def _relay_presence(self, sender_ws: Any, msg: dict[str, Any]) -> None:
+    async def _relay_presence(
+        self, sender_ws: Any, msg: dict[str, Any],
+    ) -> None:
         """
-        Relay an ephemeral cursor update to every OTHER connected client.
-        This path deliberately bypasses the mesh and the ledger -- cursor
-        coordinates have no business in the durable event log.
+        Relay an ephemeral cursor update to every OTHER connected
+        client. This path deliberately bypasses the mesh and the
+        ledger -- cursor coordinates have no business in the durable
+        event log.
         """
         meta = self._client_index.get(sender_ws)
         if not meta:
@@ -355,19 +400,11 @@ async def _demo() -> None:
     # ChronoLedger and ClientGateway both subscribe to the mesh's on_op
     # stream. compose_hooks fans the single mesh callback out to both.
     ledger = ChronoLedger(ledger_path)
-    # The gateway needs a reference to the mesh BEFORE the mesh is
-    # constructed (so the mesh's on_op can fan out to the gateway).
-    # We resolve this by constructing the gateway with a placeholder mesh
-    # reference held in a closure -- but a cleaner pattern is to attach
-    # the gateway *after* the mesh is built and let the fanout be set up
-    # via compose_hooks. So: build mesh with ledger.on_op, then build
-    # gateway, then *swap* the mesh's on_op to the composed version.
-    #
-    # We do this by constructing the mesh once with the composed hook,
-    # referencing a gateway placeholder that we'll fill in below.
     placeholder_gateway: dict[str, ClientGateway] = {}
 
-    async def composed_on_op(op: Operation[Any, Any], src: Optional[str]) -> None:
+    async def composed_on_op(
+        op: Operation[Any, Any], src: Optional[str],
+    ) -> None:
         await ledger.on_op(op, src)
         gw = placeholder_gateway.get("g")
         if gw is not None:
@@ -379,8 +416,8 @@ async def _demo() -> None:
 
     print("\n[stack]")
     print(f"  ledger    : {ledger_path}")
-    print(f"  mesh peer : ws://127.0.0.1:8201  (for other Python nodes)")
-    print(f"  gateway   : {gateway.url}  (for browser clients)")
+    print(f"  mesh peer : ws://127.0.0.1:8201  (federation, MeshPubSub)")
+    print(f"  gateway   : {gateway.url}  (browser clients only)")
 
     await ledger.boot(mesh)
     await mesh.start()
@@ -392,9 +429,6 @@ async def _demo() -> None:
     await ledger.flush()
 
     # ----- simulated browser clients --------------------------------------
-    # Two clients, both connect to the gateway. Anything one writes must
-    # appear on the other. The third client connects mid-stream to prove
-    # the initial snapshot is delivered.
     async def open_browser_client(label: str) -> tuple[Any, asyncio.Queue]:
         ws = await connect(gateway.url)
         inbox: asyncio.Queue = asyncio.Queue()
@@ -472,12 +506,24 @@ async def _demo() -> None:
         lambda m: m.get("type") == "delete" and m.get("key") == "shared:msg",
     )
     print(f"  tab C received: delete {msg['key']!r}")
-    # And the mesh-side state reflects the deletion:
     assert mesh.get("shared:msg") is None
 
-    print("\n[phase 5] ledger persisted everything (boot a fresh instance)")
+    print("\n[phase 5] malformed JSON from a client must not kill the gateway")
     print("-" * 72)
-    # Capture canonical state, then shut down, then cold-boot.
+    await ws_a.send("this is not json at all")
+    await ws_a.send(json.dumps({"type": "set"}))  # missing key
+    await ws_a.send(json.dumps({"type": "set", "key": "", "value": 1}))  # empty key
+    # Gateway must still be alive and responsive afterwards.
+    await ws_a.send(json.dumps({"type": "set", "key": "post:malformed", "value": "ok"}))
+    msg = await wait_for(
+        inbox_b,
+        lambda m: m.get("type") == "set" and m.get("key") == "post:malformed",
+    )
+    print(f"  tab B received post-malformed set: {msg['value']!r}")
+    assert msg["value"] == "ok"
+
+    print("\n[phase 6] ledger persisted everything (boot a fresh instance)")
+    print("-" * 72)
     canonical_fp = mesh.node.store.state_fingerprint()
 
     await ws_a.close()
@@ -487,21 +533,23 @@ async def _demo() -> None:
     await mesh.stop()
     await ledger.close()
 
-    # Cold boot from the same ledger file -- no mesh, no gateway.
+    # Cold boot from the same ledger file -- no mesh peers, no gateway.
     ledger2 = ChronoLedger(ledger_path)
     mesh2 = MeshNode("alpha", port=8202, on_op=ledger2.on_op)
     replayed = await ledger2.boot(mesh2)
     fresh_fp = mesh2.node.store.state_fingerprint()
     print(f"  replayed {replayed} ops from ledger written via the gateway")
-    print(f"  fingerprint matches the pre-shutdown state: "
-          f"{fresh_fp == canonical_fp}")
+    print(
+        f"  fingerprint matches the pre-shutdown state: "
+        f"{fresh_fp == canonical_fp}"
+    )
     assert fresh_fp == canonical_fp
     await ledger2.close()
 
     shutil.rmtree(workdir, ignore_errors=True)
 
     print("\n" + "=" * 72)
-    print("CLIENT GATEWAY: PROVEN  (snapshot + bidirectional sync + persistence)")
+    print("CLIENT GATEWAY: PROVEN  (snapshot + sync + malformed-input safety + persistence)")
     print("=" * 72)
 
 

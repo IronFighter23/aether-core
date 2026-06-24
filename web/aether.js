@@ -1,11 +1,27 @@
 /*
  * aether.js -- zero-dependency browser client for Aether-Core.
  *
- * Connects to a ClientGateway over WebSocket, maintains a local Map
- * of the shared state, and exposes a tiny three-method API:
+ * Offline-first storage model:
+ *   - On construction, the client synchronously hydrates its state
+ *     Map from localStorage BEFORE attempting any WebSocket
+ *     connection. ready() resolves immediately if a cache exists,
+ *     so the UI can render instantly even when the relay is offline.
+ *   - On every state mutation (local, remote-via-WebSocket, or
+ *     cross-tab via BroadcastChannel) the state is persisted back
+ *     to localStorage, debounced to ~12Hz so a 60Hz drag does not
+ *     hammer the synchronous storage API.
  *
- *     const aether = new Aether('ws://localhost:8011');
+ * Three transport tiers, in priority order:
+ *   1. localStorage    -- per-tab, survives refresh, survives server outage.
+ *   2. BroadcastChannel -- same-origin sibling tabs talk directly,
+ *                          bypassing the gateway entirely.
+ *   3. WebSocket       -- the Python relay (federation + durability).
+ *
+ * Public API:
+ *
+ *     const aether = new Aether('ws://localhost:8211');
  *     await aether.ready();           // resolves after the first snapshot
+ *                                     // (or immediately if cache is hot)
  *
  *     aether.set('counter', 42);
  *     aether.get('counter');           // -> 42
@@ -19,12 +35,35 @@
 (function (root) {
     'use strict';
 
+    // Cache schema version. Bumped only on breaking changes to the
+    // on-disk shape. Caches with a different version are ignored
+    // (UI falls back to waiting for the gateway snapshot).
+    var CACHE_VERSION = 1;
+
+    // localStorage write debounce in ms. Coalesces drag-storm writes
+    // so the synchronous storage API is hit at most once per ~80ms
+    // (~12Hz). Tuned to be invisible to the user but small enough
+    // that a refresh during a drag loses at most a few hundred ms.
+    var CACHE_DEBOUNCE_MS = 80;
+
+    function _hasLocalStorage() {
+        try {
+            return typeof window !== 'undefined'
+                && typeof window.localStorage !== 'undefined'
+                && window.localStorage !== null;
+        } catch (_) {
+            return false;
+        }
+    }
+
     class Aether {
         /**
-         * @param {string} url - The gateway WebSocket URL, e.g. 'ws://localhost:8011'.
+         * @param {string} url - The gateway WebSocket URL, e.g. 'ws://localhost:8211'.
          * @param {object} [opts]
          * @param {boolean} [opts.autoReconnect=true]
          * @param {number}  [opts.maxReconnectDelayMs=5000]
+         * @param {boolean} [opts.persist=true] - Persist state to localStorage.
+         * @param {string}  [opts.cacheKey] - Override the default cache key.
          */
         constructor(url, opts) {
             opts = opts || {};
@@ -65,9 +104,9 @@
             //
             // Each Aether instance gets a per-tab _tabId. Outbound BC
             // messages are tagged with it; inbound messages with our
-            // own _tabId are ignored. This prevents the echo storm that
-            // would otherwise happen when we re-broadcast our own
-            // local apply.
+            // own _tabId are ignored. This prevents the echo storm
+            // that would otherwise happen when we re-broadcast our
+            // own local apply.
             this._tabId = (
                 (typeof crypto !== 'undefined' && crypto.randomUUID)
                     ? crypto.randomUUID()
@@ -77,7 +116,7 @@
             try {
                 if (typeof BroadcastChannel !== 'undefined') {
                     // Channel name keyed on the gateway URL so pages
-                    // talking to different gateways don't bleed state.
+                    // talking to different gateways do not bleed state.
                     this._bc = new BroadcastChannel('aether::' + this.url);
                     this._bc.onmessage = (ev) => this._receiveLocal(ev.data);
                 }
@@ -87,41 +126,31 @@
                 this._bc = null;
             }
 
-            // ---- Cross-tab sync via BroadcastChannel ----------------
-            // Same-origin browser tabs can talk to each other directly
-            // without a WebSocket round-trip. This makes cross-tab sync
-            // instantaneous AND survives gateway outages.
-            //
-            // Each Aether instance gets a per-tab _tabId. Outbound BC
-            // messages are tagged with it; inbound messages with our
-            // own _tabId are ignored. This prevents the echo storm that
-            // would otherwise happen when we re-broadcast our own
-            // local apply.
-            this._tabId = (
-                (typeof crypto !== 'undefined' && crypto.randomUUID)
-                    ? crypto.randomUUID()
-                    : 'tab-' + Math.random().toString(36).slice(2, 10)
-            );
-            this._bc = null;
-            try {
-                if (typeof BroadcastChannel !== 'undefined') {
-                    // The channel name is keyed on the gateway URL so
-                    // pages talking to different gateways don't bleed
-                    // state into each other.
-                    this._bc = new BroadcastChannel('aether::' + this.url);
-                    this._bc.onmessage = (ev) => this._receiveLocal(ev.data);
-                }
-            } catch (_) {
-                // BroadcastChannel unavailable (very old browsers, some
-                // privacy modes). Degrade silently to WebSocket-only.
-                this._bc = null;
-            }
+            // ---- Offline-first localStorage persistence --------------
+            // Cache key is namespaced per-gateway-URL so different apps
+            // sharing an origin do not collide.
+            this._persist = opts.persist !== false;
+            this._cacheKey = opts.cacheKey
+                || ('aether::state::' + this.url);
+            this._saveTimer = null;
+            this._storageOk = this._persist && _hasLocalStorage();
 
+            // *** This is the critical line for offline-first UX ***
+            // Hydrate from cache BEFORE _connect() so ready() can
+            // resolve immediately and the UI renders on first paint,
+            // not on first network round-trip.
+            this._loadFromStorage();
+
+            // Now (and only now) open the WebSocket. If the cache
+            // populated the state, ready() has already resolved.
+            // Otherwise, ready() waits for the gateway snapshot.
             this._connect();
 
-            // If any sibling tab already has the snapshot, get it from
-            // them right away instead of waiting for our own WebSocket
-            // round-trip. They reply via 'snapshot' on the channel.
+            // If any sibling tab already has the snapshot, get it
+            // from them right away instead of waiting for our own
+            // WebSocket round-trip. They reply via 'snapshot' on the
+            // channel. (Harmless if we already hydrated from cache --
+            // _applySnapshot will diff and apply only the deltas.)
             if (this._bc) {
                 try {
                     this._bc.postMessage({
@@ -228,8 +257,11 @@
         }
 
         /**
-         * Promise that resolves once the gateway has delivered the
-         * initial snapshot. After this, ``get`` reads are authoritative.
+         * Promise that resolves once the client has *any* usable state
+         * to show: either the gateway has delivered a snapshot, OR
+         * the offline cache hydrated successfully. After this, ``get``
+         * reads are authoritative against either the server or the
+         * last-known-good cache, whichever applied first.
          */
         ready() {
             if (this._hasSnapshot) return Promise.resolve();
@@ -252,6 +284,24 @@
                 try { this._bc.close(); } catch (_) {}
                 this._bc = null;
             }
+            // Flush any pending cache write so nothing is lost on close.
+            if (this._saveTimer !== null) {
+                clearTimeout(this._saveTimer);
+                this._saveTimer = null;
+                this._saveNow();
+            }
+        }
+
+        /**
+         * Wipe the offline cache for this gateway. Useful for "log out"
+         * or "reset everything" flows. Does NOT clear in-memory state;
+         * call ``location.reload()`` afterwards if a full reset is wanted.
+         */
+        clearCache() {
+            if (!this._storageOk) return;
+            try {
+                window.localStorage.removeItem(this._cacheKey);
+            } catch (_) {}
         }
 
         // ---------------------------------------------------------------
@@ -320,12 +370,26 @@
         get clientColor() { return this._myColor; }
 
         // ---------------------------------------------------------------
-        // Internals
+        // Internals -- networking
         // ---------------------------------------------------------------
 
         _connect() {
             if (this._stopped) return;
-            const ws = new WebSocket(this.url);
+            let ws;
+            try {
+                ws = new WebSocket(this.url);
+            } catch (_) {
+                // Invalid URL or browser blocked the constructor.
+                // Schedule a retry just like onclose would.
+                if (this._autoReconnect && !this._stopped) {
+                    setTimeout(() => this._connect(), this._reconnectDelay);
+                    this._reconnectDelay = Math.min(
+                        this._reconnectDelay * 2,
+                        this._maxReconnectDelay
+                    );
+                }
+                return;
+            }
             this._ws = ws;
 
             ws.onopen = () => {
@@ -345,7 +409,10 @@
 
             ws.onclose = () => {
                 this._connected   = false;
-                this._hasSnapshot = false;
+                // Note: we do NOT reset _hasSnapshot on disconnect. The
+                // offline cache (or the last server snapshot) is still
+                // valid; ready() should keep returning the resolved
+                // promise so re-mounts of the UI don't suddenly block.
                 this._myId        = null;   // server will mint a new id
                 this._myColor     = null;
                 this._notifyStatus(false);
@@ -363,7 +430,14 @@
         }
 
         _send(obj) {
-            const raw = JSON.stringify(obj);
+            let raw;
+            try {
+                raw = JSON.stringify(obj);
+            } catch (_) {
+                // Unserialisable value (circular reference, BigInt, etc).
+                // The CRDT layer cannot accept it anyway; drop silently.
+                return;
+            }
             if (this._ws && this._ws.readyState === WebSocket.OPEN) {
                 try {
                     this._ws.send(raw);
@@ -465,9 +539,7 @@
                     // Share what we have so they don't have to wait
                     // for the gateway round-trip. We respond if we
                     // either have an authoritative snapshot OR have
-                    // any local state from optimistic writes -- so
-                    // siblings can sync even when the gateway has
-                    // never been reachable.
+                    // any local state from optimistic writes / cache.
                     if ((this._hasSnapshot || this._state.size > 0) && this._bc) {
                         try {
                             this._bc.postMessage({
@@ -479,9 +551,10 @@
                     }
                     break;
                 case 'snapshot':
-                    // Only accept a sibling's snapshot if we don't yet
-                    // have one from the gateway. Once the gateway
-                    // delivers our own snapshot, it is authoritative.
+                    // Accept a sibling's snapshot if we don't yet have
+                    // an authoritative one. (Both server-side and
+                    // cache-hydrated counts as "authoritative" here --
+                    // _hasSnapshot is set by both paths.)
                     if (!this._hasSnapshot) {
                         this._applySnapshot(msg.data || {});
                     }
@@ -503,6 +576,10 @@
                 // by contract, so this should never fire in practice.
             }
         }
+
+        // ---------------------------------------------------------------
+        // Internals -- state application
+        // ---------------------------------------------------------------
 
         _applySnapshot(data) {
             const incoming = new Map(Object.entries(data));
@@ -529,6 +606,9 @@
             this._hasSnapshot = true;
             const resolvers = this._readyResolvers.splice(0);
             for (const r of resolvers) r();
+
+            // Persist the now-authoritative state.
+            this._scheduleSave();
         }
 
         _applySet(key, value) {
@@ -537,6 +617,7 @@
             if (this._equal(oldV, value)) return;  // no-op
             this._state.set(key, value);
             this._fire(key, value, oldV);
+            this._scheduleSave();
         }
 
         _applyDelete(key) {
@@ -545,6 +626,7 @@
             const oldV = this._state.get(key);
             this._state.delete(key);
             this._fire(key, undefined, oldV);
+            this._scheduleSave();
         }
 
         _fire(key, newValue, oldValue) {
@@ -576,6 +658,87 @@
             if (typeof a !== 'object' || typeof b !== 'object') return false;
             try { return JSON.stringify(a) === JSON.stringify(b); }
             catch (_) { return false; }
+        }
+
+        // ---------------------------------------------------------------
+        // Internals -- offline-first persistence
+        // ---------------------------------------------------------------
+
+        _loadFromStorage() {
+            if (!this._storageOk) return;
+            let raw;
+            try {
+                raw = window.localStorage.getItem(this._cacheKey);
+            } catch (_) {
+                // Access can throw in restrictive iframes or after
+                // disabling site data mid-session.
+                return;
+            }
+            if (!raw) return;
+
+            let parsed;
+            try {
+                parsed = JSON.parse(raw);
+            } catch (_) {
+                // Cache corrupt -- drop and let the gateway resnapshot us.
+                try { window.localStorage.removeItem(this._cacheKey); }
+                catch (_) {}
+                return;
+            }
+            if (!parsed || typeof parsed !== 'object') return;
+            if (parsed.v !== CACHE_VERSION) return;
+            if (!parsed.data || typeof parsed.data !== 'object') return;
+
+            // Hydrate the state Map. Note: we do NOT fire watchers
+            // here -- the constructor has not yet returned, so nobody
+            // can have subscribed. Callers consume the loaded state
+            // via aether.ready().then(initialRender), which pulls
+            // values out by key.
+            for (const k of Object.keys(parsed.data)) {
+                if (typeof k !== 'string') continue;
+                this._state.set(k, parsed.data[k]);
+            }
+
+            // Mark as "we have something showable". This makes
+            // ready() resolve immediately even if the WS is down.
+            // The eventual gateway snapshot will diff against this
+            // state and patch any deltas via _fire().
+            this._hasSnapshot = true;
+            // (No resolvers to fire yet -- ready() hasn't been called.)
+        }
+
+        _scheduleSave() {
+            if (!this._storageOk) return;
+            if (this._saveTimer !== null) return;
+            this._saveTimer = setTimeout(() => {
+                this._saveTimer = null;
+                this._saveNow();
+            }, CACHE_DEBOUNCE_MS);
+        }
+
+        _saveNow() {
+            if (!this._storageOk) return;
+            const data = {};
+            for (const [k, v] of this._state) data[k] = v;
+            let serialized;
+            try {
+                serialized = JSON.stringify({ v: CACHE_VERSION, data: data });
+            } catch (_) {
+                // Unserialisable value somewhere in the state. We
+                // should never get here because Aether values are
+                // JSON by contract, but guard anyway.
+                return;
+            }
+            try {
+                window.localStorage.setItem(this._cacheKey, serialized);
+            } catch (_) {
+                // QuotaExceededError, SecurityError (private mode in
+                // some browsers), etc. Drop on the floor; in-memory
+                // state is still correct, only durability across
+                // refresh is forfeit. Disable further attempts so
+                // we do not retry on every mutation.
+                this._storageOk = false;
+            }
         }
     }
 

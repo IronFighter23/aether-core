@@ -101,16 +101,35 @@ async def _run() -> None:
     # ----- run until interrupted -----------------------------------------
     stop = asyncio.Event()
     loop = asyncio.get_event_loop()
+
+    def _request_stop(*_args: Any) -> None:
+        """Ask the main coroutine to wind down. Safe from any context."""
+        loop.call_soon_threadsafe(stop.set)
+
+    # Try the asyncio-native way first (Unix). On Windows that raises
+    # NotImplementedError, so fall back to a plain signal.signal handler.
+    # The plain handler is fine here because asyncio.run() executes the
+    # loop on the main thread, which is where signal.signal must be called.
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
             loop.add_signal_handler(sig, stop.set)
-        except NotImplementedError:
-            # Windows: signal handlers not supported in asyncio.
-            pass
+        except (NotImplementedError, RuntimeError):
+            try:
+                signal.signal(sig, _request_stop)
+            except (ValueError, OSError):
+                pass
 
+    # On Windows, Python's interpreter only checks for pending signals at
+    # bytecode boundaries; long-running asyncio waits in C can starve the
+    # handler. Polling every 500ms guarantees we yield back to the
+    # interpreter often enough that Ctrl+C is processed promptly.
     try:
-        await stop.wait()
-    except KeyboardInterrupt:
+        while not stop.is_set():
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=0.5)
+            except asyncio.TimeoutError:
+                continue
+    except (KeyboardInterrupt, asyncio.CancelledError):
         pass
 
     print("\nshutting down…")
@@ -122,4 +141,10 @@ async def _run() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(_run())
+    try:
+        asyncio.run(_run())
+    except KeyboardInterrupt:
+        # Defensive: a Ctrl+C arriving before our handler installs (or
+        # between asyncio.run returning and process exit) should not
+        # print an ugly traceback.
+        print("\ninterrupted.")

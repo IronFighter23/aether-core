@@ -1,7 +1,7 @@
 """Aether-Core: Zero-Transit Architecture primitives."""
 
 __author__  = "Nishant Bhatte"
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 __license__ = "MIT"
 
 from aether_core.crdt import (
@@ -15,6 +15,8 @@ from aether_core.crdt import (
 )
 from aether_core.mesh import (
     MeshNode,
+    MeshPubSub,
+    WebSocketMeshPubSub,
     serialize_hlc,
     deserialize_hlc,
     serialize_operation,
@@ -33,6 +35,8 @@ __all__ = [
     "OpKind",
     "Node",
     "MeshNode",
+    "MeshPubSub",
+    "WebSocketMeshPubSub",
     "serialize_hlc",
     "deserialize_hlc",
     "serialize_operation",

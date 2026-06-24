@@ -1,53 +1,20 @@
-# ---------- Python ----------
+# Python
 __pycache__/
 *.py[cod]
-*$py.class
-*.so
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
 *.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
-
-# ---------- Virtual environments ----------
-venv/
-env/
-.env/
 .venv/
-ENV/
+venv/
 
-# ---------- Aether-Core runtime artifacts ----------
-# Append-only event ledgers produced by ChronoLedger.
-*.jsonl
+# Aether-Core runtime artifacts
 ledger_*.jsonl
+ledger_*.snapshot.json
+ledger_*.archived.*
 
-# ---------- IDE / editor ----------
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-
-# ---------- OS ----------
+# OS
 .DS_Store
 Thumbs.db
 
-# ---------- Coverage / tests ----------
-.coverage
-.coverage.*
-htmlcov/
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
+# Editors
+.vscode/
+.idea/
+*.swp
