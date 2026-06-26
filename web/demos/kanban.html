@@ -1,0 +1,574 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Aether-Core · Kanban</title>
+<style>
+:root {
+  --bg-0: #0d1117;
+  --bg-1: #161b22;
+  --bg-2: #1f2933;
+  --bg-3: #2a3441;
+  --border: #30363d;
+  --text: #e6edf3;
+  --text-dim: #8b949e;
+  --accent: #58a6ff;
+  --accent-dim: rgba(88,166,255,0.12);
+  --green: #56d364;
+  --red: #f85149;
+  --amber: #d29922;
+  --shadow: 0 4px 12px rgba(0,0,0,0.4);
+  --shadow-lg: 0 8px 24px rgba(0,0,0,0.5);
+  --radius: 8px;
+  --font: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --mono: ui-monospace, "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; height: 100%; }
+body {
+  background: var(--bg-0);
+  color: var(--text);
+  font-family: var(--font);
+  font-size: 14px;
+  line-height: 1.5;
+  overflow: hidden;
+}
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+}
+header {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 10px 16px;
+  background: var(--bg-1);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+header .title {
+  font-weight: 600;
+  font-size: 15px;
+  letter-spacing: -0.01em;
+}
+header .title .badge {
+  font-size: 11px;
+  font-weight: 500;
+  background: var(--accent-dim);
+  color: var(--accent);
+  padding: 2px 7px;
+  border-radius: 4px;
+  margin-left: 8px;
+  font-family: var(--mono);
+}
+header .spacer { flex: 1; }
+header .status {
+  font-size: 12px;
+  color: var(--text-dim);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--mono);
+}
+header .status .dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--red);
+  transition: background 0.2s;
+}
+header .status.connected .dot { background: var(--green); }
+header button {
+  background: var(--bg-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  padding: 6px 12px;
+  border-radius: 6px;
+  font-family: var(--font);
+  font-size: 13px;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+header button:hover { background: var(--bg-3); border-color: var(--accent); }
+header button.primary {
+  background: var(--accent);
+  color: var(--bg-0);
+  border-color: var(--accent);
+  font-weight: 500;
+}
+header button.primary:hover { background: #79b8ff; }
+
+.board {
+  flex: 1;
+  display: flex;
+  gap: 14px;
+  padding: 14px;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+.column {
+  background: var(--bg-1);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  width: 300px;
+  min-width: 300px;
+  display: flex;
+  flex-direction: column;
+  max-height: 100%;
+}
+.column.drag-over {
+  border-color: var(--accent);
+  background: var(--accent-dim);
+}
+.col-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.col-title {
+  flex: 1;
+  font-weight: 600;
+  font-size: 13px;
+  background: transparent;
+  border: none;
+  outline: none;
+  color: var(--text);
+  padding: 2px 4px;
+  border-radius: 4px;
+  font-family: var(--font);
+}
+.col-title:focus { background: var(--bg-2); }
+.col-count {
+  font-size: 11px;
+  font-family: var(--mono);
+  color: var(--text-dim);
+  background: var(--bg-2);
+  padding: 2px 7px;
+  border-radius: 10px;
+}
+.col-del {
+  background: transparent;
+  border: none;
+  color: var(--text-dim);
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 16px;
+  line-height: 1;
+}
+.col-del:hover { color: var(--red); background: var(--bg-3); }
+
+.cards {
+  flex: 1;
+  padding: 10px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 60px;
+}
+.card {
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px 12px;
+  cursor: grab;
+  user-select: none;
+  transition: box-shadow 0.1s, transform 0.05s, border-color 0.1s;
+}
+.card:hover { border-color: var(--accent); }
+.card.dragging {
+  opacity: 0.35;
+  cursor: grabbing;
+}
+.card-title {
+  font-size: 13px;
+  font-weight: 500;
+  background: transparent;
+  border: none;
+  outline: none;
+  color: var(--text);
+  width: 100%;
+  font-family: var(--font);
+  resize: none;
+  padding: 0;
+  min-height: 1.4em;
+  line-height: 1.4;
+}
+.card-meta {
+  display: flex;
+  gap: 6px;
+  margin-top: 8px;
+  font-size: 11px;
+  color: var(--text-dim);
+  font-family: var(--mono);
+  align-items: center;
+}
+.card-meta .tag {
+  background: var(--bg-3);
+  padding: 1px 6px;
+  border-radius: 3px;
+}
+.card-meta .tag.priority-high  { background: rgba(248,81,73,0.18);  color: var(--red); }
+.card-meta .tag.priority-med   { background: rgba(210,153,34,0.18); color: var(--amber); }
+.card-meta .tag.priority-low   { background: rgba(86,211,100,0.18); color: var(--green); }
+.card-meta .spacer { flex: 1; }
+.card-meta .card-del {
+  background: transparent;
+  border: none;
+  color: var(--text-dim);
+  cursor: pointer;
+  padding: 0;
+  font-size: 12px;
+}
+.card-meta .card-del:hover { color: var(--red); }
+
+.add-card {
+  background: transparent;
+  border: 1px dashed var(--border);
+  color: var(--text-dim);
+  padding: 8px;
+  border-radius: 6px;
+  cursor: pointer;
+  margin-top: 4px;
+  font-family: var(--font);
+  font-size: 12px;
+  transition: border-color 0.15s, color 0.15s, background 0.15s;
+}
+.add-card:hover { border-color: var(--accent); color: var(--accent); background: var(--accent-dim); }
+
+.add-column {
+  background: var(--bg-1);
+  border: 1px dashed var(--border);
+  color: var(--text-dim);
+  padding: 14px 18px;
+  border-radius: var(--radius);
+  cursor: pointer;
+  min-width: 220px;
+  align-self: flex-start;
+  font-size: 13px;
+  height: fit-content;
+}
+.add-column:hover { border-color: var(--accent); color: var(--accent); }
+
+footer {
+  padding: 6px 16px;
+  background: var(--bg-1);
+  border-top: 1px solid var(--border);
+  font-size: 11px;
+  font-family: var(--mono);
+  color: var(--text-dim);
+  display: flex;
+  justify-content: space-between;
+  flex-shrink: 0;
+}
+footer a { color: var(--accent); text-decoration: none; }
+footer a:hover { text-decoration: underline; }
+.priority-cycle {
+  background: transparent;
+  border: none;
+  color: inherit;
+  cursor: pointer;
+  font-family: inherit;
+  font-size: inherit;
+  padding: 1px 6px;
+  border-radius: 3px;
+}
+.priority-cycle:hover { filter: brightness(1.3); }
+
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: var(--bg-0); }
+::-webkit-scrollbar-thumb { background: var(--bg-3); border-radius: 5px; }
+::-webkit-scrollbar-thumb:hover { background: #3d4a5c; }
+</style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <div class="title">Aether-Core <span class="badge">Kanban</span></div>
+    <button id="reset" title="Wipe local cache and reload">Reset</button>
+    <div class="spacer"></div>
+    <div id="status" class="status"><span class="dot"></span><span class="text">connecting…</span></div>
+  </header>
+  <div id="board" class="board"></div>
+  <footer>
+    <span id="counts">0 columns · 0 cards</span>
+    <span>Built on Aether-Core · <a href="../index.html">Topology demo</a> · <a href="markdown.html">Markdown demo</a></span>
+  </footer>
+</div>
+
+<script src="../aether.js"></script>
+<script>
+'use strict';
+
+/* -----------------------------------------------------------------
+ * State schema (CRDT keys)
+ * -----------------------------------------------------------------
+ *
+ *  col:<colId>            { id, title, order }
+ *  card:<cardId>          { id, columnId, title, order, priority }
+ *
+ * The gateway URL is derived from the page origin so the demo works
+ * regardless of how the page is served (run_demo.py runs HTTP on
+ * 8080 and the gateway on 8211).
+ */
+
+const GATEWAY_URL = (location.protocol === 'https:' ? 'wss://' : 'ws://')
+                  + location.hostname + ':8211';
+
+const aether = new Aether(GATEWAY_URL, { cacheKey: 'aether::kanban::v1' });
+
+// ---- DOM refs -----------------------------------------------------
+const $board   = document.getElementById('board');
+const $status  = document.getElementById('status');
+const $counts  = document.getElementById('counts');
+const $reset   = document.getElementById('reset');
+
+// ---- ID generation -----------------------------------------------
+const newId = (prefix) => prefix + '-' + (
+  crypto.randomUUID ? crypto.randomUUID().slice(0, 8)
+                    : Math.random().toString(36).slice(2, 10)
+);
+
+// ---- Helpers ------------------------------------------------------
+
+function readColumns() {
+  const out = [];
+  for (const key of aether.keys()) {
+    if (key.startsWith('col:')) {
+      const v = aether.get(key);
+      if (v && typeof v === 'object') out.push(v);
+    }
+  }
+  out.sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+  return out;
+}
+
+function readCards(columnId) {
+  const out = [];
+  for (const key of aether.keys()) {
+    if (key.startsWith('card:')) {
+      const v = aether.get(key);
+      if (v && typeof v === 'object' && v.columnId === columnId) out.push(v);
+    }
+  }
+  out.sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+  return out;
+}
+
+function allCards() {
+  const out = [];
+  for (const key of aether.keys()) {
+    if (key.startsWith('card:')) {
+      const v = aether.get(key);
+      if (v && typeof v === 'object') out.push(v);
+    }
+  }
+  return out;
+}
+
+// ---- Renderers (idempotent; safe to call repeatedly) -------------
+
+function renderAll() {
+  const columns = readColumns();
+  $board.innerHTML = '';
+  for (const col of columns) {
+    $board.appendChild(renderColumn(col));
+  }
+  // Final "add column" pseudo-card.
+  const addCol = document.createElement('button');
+  addCol.className = 'add-column';
+  addCol.textContent = '+ add column';
+  addCol.onclick = onAddColumn;
+  $board.appendChild(addCol);
+  updateCounts();
+}
+
+function renderColumn(col) {
+  const el = document.createElement('div');
+  el.className = 'column';
+  el.dataset.colId = col.id;
+
+  // Drag/drop targets for cards moving between columns.
+  el.ondragover  = (e) => { e.preventDefault(); el.classList.add('drag-over'); };
+  el.ondragleave = ()  => el.classList.remove('drag-over');
+  el.ondrop      = (e) => {
+    e.preventDefault();
+    el.classList.remove('drag-over');
+    const cardId = e.dataTransfer.getData('text/aether-card');
+    if (cardId) moveCardToColumn(cardId, col.id);
+  };
+
+  // Header
+  const head = document.createElement('div');
+  head.className = 'col-head';
+  const title = document.createElement('input');
+  title.className = 'col-title';
+  title.value = col.title || 'New column';
+  title.onchange = () => {
+    aether.set('col:' + col.id, { ...col, title: title.value.trim() || 'Untitled' });
+  };
+  const count = document.createElement('span');
+  count.className = 'col-count';
+  const del = document.createElement('button');
+  del.className = 'col-del';
+  del.innerHTML = '×';
+  del.title = 'Delete column';
+  del.onclick = () => {
+    // Also delete every card in the column. Tombstones make this safe.
+    for (const c of readCards(col.id)) aether.delete('card:' + c.id);
+    aether.delete('col:' + col.id);
+  };
+  head.append(title, count, del);
+  el.appendChild(head);
+
+  // Cards
+  const cardsBox = document.createElement('div');
+  cardsBox.className = 'cards';
+  const cards = readCards(col.id);
+  count.textContent = cards.length;
+  for (const card of cards) cardsBox.appendChild(renderCard(card));
+  const addBtn = document.createElement('button');
+  addBtn.className = 'add-card';
+  addBtn.textContent = '+ add card';
+  addBtn.onclick = () => addCard(col.id);
+  cardsBox.appendChild(addBtn);
+  el.appendChild(cardsBox);
+
+  return el;
+}
+
+function renderCard(card) {
+  const el = document.createElement('div');
+  el.className = 'card';
+  el.draggable = true;
+  el.dataset.cardId = card.id;
+
+  el.ondragstart = (e) => {
+    el.classList.add('dragging');
+    e.dataTransfer.setData('text/aether-card', card.id);
+    e.dataTransfer.effectAllowed = 'move';
+  };
+  el.ondragend = () => el.classList.remove('dragging');
+
+  const title = document.createElement('textarea');
+  title.className = 'card-title';
+  title.value = card.title || '';
+  title.rows = 1;
+  title.placeholder = 'Type a task title…';
+  title.oninput = () => {
+    title.style.height = 'auto';
+    title.style.height = title.scrollHeight + 'px';
+  };
+  title.onblur = () => {
+    if (title.value !== card.title) {
+      aether.set('card:' + card.id, { ...card, title: title.value });
+    }
+  };
+  // Initial auto-height.
+  setTimeout(() => {
+    title.style.height = 'auto';
+    title.style.height = title.scrollHeight + 'px';
+  }, 0);
+
+  const meta = document.createElement('div');
+  meta.className = 'card-meta';
+  const priority = document.createElement('button');
+  const prio = card.priority || 'med';
+  priority.className = 'priority-cycle tag priority-' + prio;
+  priority.textContent = prio === 'high' ? 'high'
+                       : prio === 'low'  ? 'low'  : 'med';
+  priority.title = 'Click to cycle priority';
+  priority.onclick = () => {
+    const next = prio === 'low' ? 'med' : prio === 'med' ? 'high' : 'low';
+    aether.set('card:' + card.id, { ...card, priority: next });
+  };
+  const spacer = document.createElement('span');
+  spacer.className = 'spacer';
+  const cdel = document.createElement('button');
+  cdel.className = 'card-del';
+  cdel.textContent = 'delete';
+  cdel.onclick = (e) => { e.stopPropagation(); aether.delete('card:' + card.id); };
+  meta.append(priority, spacer, cdel);
+
+  el.append(title, meta);
+  return el;
+}
+
+function updateCounts() {
+  const cols = readColumns().length;
+  const cards = allCards().length;
+  $counts.textContent = `${cols} column${cols === 1 ? '' : 's'} · ${cards} card${cards === 1 ? '' : 's'}`;
+}
+
+// ---- Actions ------------------------------------------------------
+
+function onAddColumn() {
+  const cols = readColumns();
+  const order = cols.length ? Math.max(...cols.map(c => c.order ?? 0)) + 1 : 0;
+  const id = newId('col');
+  aether.set('col:' + id, {
+    id, title: 'New column', order,
+  });
+}
+
+function addCard(columnId) {
+  const cards = readCards(columnId);
+  const order = cards.length ? Math.max(...cards.map(c => c.order ?? 0)) + 1 : 0;
+  const id = newId('card');
+  aether.set('card:' + id, {
+    id, columnId, title: '', order, priority: 'med',
+  });
+}
+
+function moveCardToColumn(cardId, columnId) {
+  const card = aether.get('card:' + cardId);
+  if (!card || card.columnId === columnId) return;
+  const cardsInTarget = readCards(columnId);
+  const order = cardsInTarget.length
+    ? Math.max(...cardsInTarget.map(c => c.order ?? 0)) + 1
+    : 0;
+  aether.set('card:' + cardId, { ...card, columnId, order });
+}
+
+// ---- Wiring -------------------------------------------------------
+
+aether.onStatus((connected) => {
+  if (connected) {
+    $status.classList.add('connected');
+    $status.querySelector('.text').textContent = 'connected · ' + GATEWAY_URL.replace('ws://', '');
+  } else {
+    $status.classList.remove('connected');
+    $status.querySelector('.text').textContent = 'disconnected · retrying…';
+  }
+});
+
+aether.onAny((key) => {
+  // Re-render on any change. The board is small enough that a full
+  // re-render per change is well under one frame -- much simpler than
+  // maintaining a granular diff against the DOM.
+  if (key.startsWith('col:') || key.startsWith('card:')) renderAll();
+});
+
+$reset.onclick = () => {
+  if (!confirm('This wipes your local cache and reloads the page.')) return;
+  aether.clearCache();
+  location.reload();
+};
+
+// First-paint: render from cache if hot, then upgrade via server snapshot.
+aether.ready().then(() => {
+  // Seed an empty board with default columns the first time.
+  if (readColumns().length === 0) {
+    aether.set('col:' + newId('col'), { id: 'todo',  title: 'To do',       order: 0 });
+    aether.set('col:' + newId('col'), { id: 'doing', title: 'In progress', order: 1 });
+    aether.set('col:' + newId('col'), { id: 'done',  title: 'Done',        order: 2 });
+  }
+  renderAll();
+});
+</script>
+</body>
+</html>

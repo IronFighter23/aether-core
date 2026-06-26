@@ -4,6 +4,12 @@ __pycache__/
 *.egg-info/
 .venv/
 venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# uv
+uv.lock
 
 # Aether-Core runtime artifacts
 ledger_*.jsonl
@@ -18,3 +24,7 @@ Thumbs.db
 .vscode/
 .idea/
 *.swp
+
+# Benchmark artifacts
+# (results.json IS committed deliberately so anyone browsing the repo
+#  sees real numbers; only delete it locally before re-benchmarking)

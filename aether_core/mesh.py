@@ -51,6 +51,15 @@ from typing import Any, Awaitable, Callable, Optional
 from websockets import connect, serve
 from websockets.exceptions import ConnectionClosed
 
+from aether_core._security import (
+    ConnectionCounter,
+    ConnectionLimitError,
+    PayloadTooLargeError,
+    SecurityLimits,
+    TokenBucket,
+    validate_payload,
+    with_handshake_timeout,
+)
 from aether_core.crdt import (
     HybridLogicalClock,
     Node,
@@ -213,16 +222,29 @@ class WebSocketMeshPubSub(MeshPubSub):
 
     __slots__ = (
         "_node_id", "_host", "_port",
-        "_connections", "_server", "_tasks", "_lock", "_closed",
+        "_limits",
+        "_connections", "_buckets", "_conn_counter",
+        "_server", "_tasks", "_lock", "_closed",
     )
 
-    def __init__(self, node_id: str, host: str = "127.0.0.1", port: int = 0) -> None:
+    def __init__(
+        self,
+        node_id: str,
+        host: str = "127.0.0.1",
+        port: int = 0,
+        *,
+        limits: Optional[SecurityLimits] = None,
+    ) -> None:
         super().__init__()
         self._node_id = node_id
         self._host = host
         self._port = port
-        # peer_id -> live WebSocket (server- or client-side, both duplex).
+        self._limits = limits or SecurityLimits()
+        # peer_id -> live WebSocket
         self._connections: dict[str, Any] = {}
+        # peer_id -> TokenBucket  (peers get their own rate budget)
+        self._buckets: dict[str, TokenBucket] = {}
+        self._conn_counter = ConnectionCounter(limits=self._limits)
         self._server: Optional[Any] = None
         self._tasks: set[asyncio.Task[Any]] = set()
         self._lock = asyncio.Lock()
@@ -249,15 +271,24 @@ class WebSocketMeshPubSub(MeshPubSub):
             raise RuntimeError("driver already stopped; construct a new one")
         if self._server is not None:
             return
-        self._server = await serve(self._handle_inbound, self._host, self._port)
+        self._server = await serve(
+            self._handle_inbound,
+            self._host,
+            self._port,
+            max_size=self._limits.max_frame_bytes,
+        )
         # Resolve ephemeral ports if the caller asked for one.
         if self._port == 0:
             for sock in self._server.sockets:
                 self._port = sock.getsockname()[1]
                 break
         logger.info(
-            "[%s] mesh-pubsub listening on ws://%s:%d",
+            "[%s] mesh-pubsub listening on ws://%s:%d "
+            "(rate=%.0f msg/s, max_peers=%d, frame_cap=%d B)",
             self._node_id, self._host, self._port,
+            self._limits.messages_per_second,
+            self._limits.max_connections_total,
+            self._limits.max_frame_bytes,
         )
 
     async def stop(self) -> None:
@@ -296,10 +327,13 @@ class WebSocketMeshPubSub(MeshPubSub):
         if self._closed:
             raise RuntimeError("driver stopped")
         uri = f"ws://{host}:{port}"
-        ws = await connect(uri)
+        ws = await connect(uri, max_size=self._limits.max_frame_bytes)
         try:
             await ws.send(json.dumps({"type": "hello", "node_id": self._node_id}))
-            raw = await ws.recv()
+            # Slow-loris guard: peer must hello back within handshake_timeout_s.
+            raw = await with_handshake_timeout(
+                ws.recv(), limits=self._limits, what=f"outbound hello to {uri}",
+            )
             msg = json.loads(raw)
             if msg.get("type") != "hello" or "node_id" not in msg:
                 await ws.close()
@@ -328,27 +362,55 @@ class WebSocketMeshPubSub(MeshPubSub):
     async def _handle_inbound(self, ws: Any) -> None:
         """Websockets server handler. One coroutine per inbound connection."""
         peer_id: Optional[str] = None
+        source = "?"
         try:
-            raw = await ws.recv()
+            try:
+                addr = ws.remote_address
+                if addr:
+                    source = str(addr[0])
+            except Exception:  # noqa: BLE001
+                pass
+
+            # 1. Connection cap.
+            try:
+                self._conn_counter.acquire(source)
+            except ConnectionLimitError as e:
+                logger.warning("[%s] refused peer from %s: %s", self._node_id, source, e)
+                try:
+                    await ws.close(code=1013, reason="server busy")
+                except Exception:  # noqa: BLE001
+                    pass
+                return
+
+            # 2. Slow-loris guard on hello.
+            try:
+                raw = await with_handshake_timeout(
+                    ws.recv(), limits=self._limits, what="inbound hello",
+                )
+            except asyncio.TimeoutError:
+                self._conn_counter.release(source)
+                return
+
             try:
                 msg = json.loads(raw)
             except json.JSONDecodeError:
                 await ws.close()
+                self._conn_counter.release(source)
                 return
             if not isinstance(msg, dict) or msg.get("type") != "hello" \
                or "node_id" not in msg:
                 await ws.close()
+                self._conn_counter.release(source)
                 return
             peer_id = str(msg["node_id"])
             await ws.send(json.dumps({"type": "hello", "node_id": self._node_id}))
 
             if not await self._register_connection(peer_id, ws, direction="in"):
                 await ws.close()
+                self._conn_counter.release(source)
                 return
 
-            logger.info("[%s] inbound  <- %s", self._node_id, peer_id)
-            # Run the read loop *inline* on the handler task; when it
-            # returns, the websockets library closes the connection.
+            logger.info("[%s] inbound  <- %s (from %s)", self._node_id, peer_id, source)
             await self._read_loop(peer_id, ws)
         except ConnectionClosed:
             pass
@@ -359,6 +421,8 @@ class WebSocketMeshPubSub(MeshPubSub):
                 async with self._lock:
                     if self._connections.get(peer_id) is ws:
                         self._connections.pop(peer_id, None)
+                    self._buckets.pop(peer_id, None)
+                self._conn_counter.release(source)
 
     async def _register_connection(
         self, peer_id: str, ws: Any, *, direction: str,
@@ -377,6 +441,10 @@ class WebSocketMeshPubSub(MeshPubSub):
                 )
                 return False
             self._connections[peer_id] = ws
+            self._buckets[peer_id] = TokenBucket(
+                capacity=self._limits.messages_burst,
+                refill_per_second=self._limits.messages_per_second,
+            )
             return True
 
     def _spawn_read_loop(self, peer_id: str, ws: Any) -> None:
@@ -396,10 +464,34 @@ class WebSocketMeshPubSub(MeshPubSub):
     # -- federation: message pump ------------------------------------------
 
     async def _read_loop(self, peer_id: str, ws: Any) -> None:
+        bucket = self._buckets.get(peer_id)
         try:
             async for raw in ws:
+                # 1. Rate-limit. Misbehaving peers are dropped, not back-pressured.
+                if bucket is not None and not bucket.try_consume():
+                    logger.warning(
+                        "[%s] peer %s exceeded rate budget, closing",
+                        self._node_id, peer_id,
+                    )
+                    try:
+                        await ws.close(code=1008, reason="rate limit")
+                    except Exception:  # noqa: BLE001
+                        pass
+                    return
+
+                # 2. Payload validation (size, encoding).
                 try:
-                    msg = json.loads(raw)
+                    text = validate_payload(raw, self._limits)
+                except (PayloadTooLargeError, ValueError) as e:
+                    logger.warning(
+                        "[%s] bad payload from %s: %s",
+                        self._node_id, peer_id, e,
+                    )
+                    continue
+
+                # 3. JSON parse.
+                try:
+                    msg = json.loads(text)
                 except json.JSONDecodeError:
                     logger.warning("[%s] bad JSON from %s", self._node_id, peer_id)
                     continue
@@ -505,21 +597,16 @@ class MeshNode:
         *,
         on_op: Optional[Callable[[Operation[Any, Any], Optional[str]], Awaitable[None]]] = None,
         pubsub: Optional[MeshPubSub] = None,
+        limits: Optional[SecurityLimits] = None,
     ) -> None:
         self.node: Node[str, Any] = Node(node_id)
         # Default driver: WebSocket gossip on (host, port).
         self._pubsub: MeshPubSub = (
             pubsub if pubsub is not None
-            else WebSocketMeshPubSub(node_id, host, port)
+            else WebSocketMeshPubSub(node_id, host, port, limits=limits)
         )
         self._pubsub.set_on_remote_op(self._ingest_remote)
-        # HLC stamps already processed (loop prevention for epidemic
-        # gossip). Public-ish: ``ChronoLedger`` populates this during
-        # replay so already-persisted ops are not re-broadcast on boot.
         self._seen: set[HybridLogicalClock] = set()
-        # Optional hook: called for every op the mesh ingests (local
-        # or remote). ``ChronoLedger`` and ``ClientGateway`` subscribe
-        # here, fanned out via ``compose_hooks``.
         self._on_op = on_op
 
     # -- introspection ------------------------------------------------------

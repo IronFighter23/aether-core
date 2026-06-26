@@ -1,0 +1,114 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "aether-core"
+version = "0.3.0"
+description = "Zero-Transit sync engine — your frontend variables are the database"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [
+    { name = "Nishant Bhatte" }
+]
+keywords = [
+    "crdt",
+    "real-time",
+    "collaborative",
+    "websocket",
+    "sync",
+    "distributed-systems",
+    "offline-first",
+    "zero-transit",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: System :: Distributed Computing",
+    "Topic :: Internet :: WWW/HTTP :: WSGI :: Application",
+]
+dependencies = [
+    "websockets>=11.0.3,<14",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.4",
+]
+bench = [
+    # Benchmarks use only stdlib + websockets, but expose the extra
+    # so future histogram/plotting tools can be added cleanly.
+]
+
+[project.urls]
+Homepage      = "https://github.com/IronFighter23/aether-core"
+Repository    = "https://github.com/IronFighter23/aether-core"
+Issues        = "https://github.com/IronFighter23/aether-core/issues"
+Documentation = "https://github.com/IronFighter23/aether-core#readme"
+
+[project.scripts]
+aether-demo       = "aether_core.cli:demo"
+aether-benchmark  = "aether_core.cli:benchmark"
+
+# --- Tooling ----------------------------------------------------------------
+
+[tool.hatch.build.targets.wheel]
+packages = ["aether_core"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "aether_core/",
+    "web/",
+    "tests/",
+    "benchmarks/",
+    "docs/",
+    "demos/",
+    "README.md",
+    "LICENSE",
+    "SECURITY.md",
+    "BENCHMARKS.md",
+    "run_demo.py",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-ra --strict-markers"
+
+[tool.ruff]
+line-length    = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF"]
+ignore = ["E501"]   # line length policed by formatter, not the linter
+
+# --- uv (the recommended workflow) ------------------------------------------
+#
+# Quickstart, no global pip install required:
+#
+#     git clone https://github.com/IronFighter23/aether-core
+#     cd aether-core
+#     uv sync                       # creates .venv with locked deps
+#     uv run aether-demo            # start the topology + kanban + markdown demos
+#     uv run aether-benchmark       # run the full benchmark suite
+#     uv run pytest                 # run the test suite (including protocol conformance)
+#
+# Editable install for development:
+#
+#     uv sync --all-extras
+#
+# Build a wheel for publishing:
+#
+#     uv build

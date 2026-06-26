@@ -2,6 +2,11 @@
 
 > **Skip the APIs—your frontend variables are the database.**
 
+[![tests](https://img.shields.io/badge/tests-26%20passing-brightgreen)](#tests)
+[![security](https://img.shields.io/badge/security-rate--limited%20%2B%20capped-blue)](SECURITY.md)
+[![benchmarks](https://img.shields.io/badge/p50%20roundtrip-0.21%20ms-brightgreen)](BENCHMARKS.md)
+[![license](https://img.shields.io/badge/license-MIT-lightgrey)](LICENSE)
+
 Aether-Core eliminates backend business logic entirely. The application
 lives in the browser: a local CRDT engine holds every piece of state as
 ordinary JavaScript variables, and any code that wants to read or write
@@ -14,29 +19,61 @@ does not implement features, does not validate domain rules, does not
 expose endpoints, and does not interpret payloads. It does exactly three
 things:
 
-1. **Relay.** Forward CRDT operations between connected browser tabs
-   and (optionally) between federated Python nodes.
-2. **Persist.** Append each operation to an immutable JSON-lines file
+1. **Relay** — forward CRDT operations between browser tabs and (optionally)
+   between federated Python nodes.
+2. **Persist** — append each operation to an immutable JSON-lines file
    so state survives restarts.
-3. **Replay.** On boot, feed the ledger back into the same CRDT engine
+3. **Replay** — on boot, feed the ledger back into the same CRDT engine
    so every replica reconstructs identical state.
 
-That's the entire job. Adding a new feature to your application means
-adding a new variable in your frontend — never a migration, an endpoint,
-a controller, a DTO, or a serializer.
+Adding a new feature to your application means adding a new variable
+in your frontend — never a migration, an endpoint, a controller, a
+DTO, or a serializer.
+
+---
+
+## Quickstart
+
+The recommended quickstart uses [`uv`](https://docs.astral.sh/uv/) — no
+global `pip install` required:
+
+```bash
+git clone https://github.com/IronFighter23/aether-core
+cd aether-core
+uv sync                       # creates .venv with locked deps
+uv run aether-demo            # start the demos
+```
+
+Then open any of:
+
+- <http://localhost:8080/> — **enterprise network topology** (drag-drop graph editor)
+- <http://localhost:8080/demos/kanban.html> — **collaborative Kanban board**
+- <http://localhost:8080/demos/markdown.html> — **paragraph-keyed Markdown editor with live preview**
+
+Open any URL in two browser tabs to see real-time sync. Stop the
+server, refresh — the page renders from `localStorage`.
+
+If you can't (or don't want to) install `uv`:
+
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -e .
+python run_demo.py
+```
 
 ---
 
 ## What the Python server is *not*
 
-To prevent the confusion that has historically dogged "serverless" pitches,
-here is an explicit list of things the Python server in Aether-Core
-**does not do**:
+To prevent the confusion that has historically dogged "serverless"
+pitches, here is an explicit list of things the Python server in
+Aether-Core **does not do**:
 
 * It does **not** expose a REST or GraphQL API.
-* It does **not** know what a "user" or a "device" or a "topology link"
+* It does **not** know what a "user" or a "device" or a "kanban card"
   is. To the relay, every key is opaque bytes.
-* It does **not** validate, transform, or interpret payload values.
+* It does **not** validate, transform, or interpret payload values
+  beyond size/type sanity checks needed for DoS resistance.
 * It does **not** run queries — there is no query language and no indexes.
 * It does **not** enforce business rules. All invariants are enforced
   client-side, because the client is the only place that knows what the
@@ -44,274 +81,208 @@ here is an explicit list of things the Python server in Aether-Core
 * It does **not** require a database. The "database" is an append-only
   JSONL file.
 
-What it *does* do, in code, fits in three small modules:
+What it *does* do, in code, fits in four small modules:
 
-| Module                | What it does                                              | Lines |
-|-----------------------|-----------------------------------------------------------|------:|
-| `aether_core/mesh.py` | `MeshPubSub` driver: gossip CRDT ops between Python nodes | ~480  |
-| `aether_core/gateway.py` | `ClientGateway`: relay CRDT ops between browser tabs    | ~480  |
-| `aether_core/storage.py` | `ChronoLedger`: append-only JSONL persistence           | ~440  |
-
-Everything else is supporting structure: the CRDT engine itself (math),
-the log-compaction worker (cleanup), and the demo whiteboard application
-(an example of building on the stack).
+| Module | Purpose |
+|---|---|
+| `aether_core/mesh.py` | `MeshPubSub` driver: gossip CRDT ops between nodes |
+| `aether_core/gateway.py` | `ClientGateway`: relay ops between browser tabs (rate-limited, payload-capped) |
+| `aether_core/storage.py` | `ChronoLedger`: append-only JSONL persistence |
+| `aether_core/_security.py` | Token bucket + connection counter + payload validators |
 
 ---
 
-## Architecture — separation of concerns
+## Three "killer" demos
 
-V2 introduces a strict Adapter-pattern boundary between **client-facing**
-traffic and **server-to-server federation**. The three relay/storage
-components do not reach across each other's boundaries:
+All three apps are built on the same engine. Open any of them in two
+browser tabs to see real-time collaborative editing. Kill the server
+and refresh to see offline-first persistence kick in.
 
-```
-   ┌─────────────────────┐                ┌─────────────────────┐
-   │   browser tab 1     │                │   browser tab 2     │
-   │   (aether.js +      │  ws://*:8211   │   (aether.js +      │
-   │    localStorage)    │ ──────┐  ┌──── │    localStorage)    │
-   └─────────────────────┘       ▼  ▼     └─────────────────────┘
+### Topology diagrammer (`/`)
+Drop firewalls, switches, NAS units, routers, load balancers, VAPT
+endpoints, and proxies on a canvas. Wire them with typed links
+(1G / 10G / Wi-Fi / dark fiber). Drag, rename, recolour, delete.
+Every change syncs to every tab. State schema lives entirely in
+JS variables.
 
-                       ┌──────────────────────┐
-                       │   ClientGateway      │   ← browser <-> server ONLY
-                       │   (gateway.py)       │
-                       └──────────┬───────────┘
-                                  │ on_op
-                                  ▼
-                       ┌──────────────────────┐
-                       │   MeshNode           │   ← orchestrator:
-                       │   (mesh.py)          │     - owns CRDT replica
-                       └──────┬─────────┬─────┘     - HLC dedup
-                              │         │           - epidemic relay
-                              ▼         ▼
-                     ┌────────────┐  ┌─────────────────────┐
-                     │ChronoLedger│  │  MeshPubSub driver  │ ← server <-> server ONLY
-                     │(storage.py)│  │  (WebSocketMeshPubSub
-                     └─────┬──────┘  │   or any other      │
-                           │ fsync   │   implementation)   │
-                           ▼         └─────────┬───────────┘
-                  ledger_demo.jsonl            │ ws://*:8201
-                                               ▼
-                                       (other federated nodes)
-```
+### Kanban board (`/demos/kanban.html`)
+Columns and cards. Drag cards between columns. Cycle card priority
+between low/med/high with a click. Edit titles in place. Delete a
+column and all its cards (tombstoned, not silently lost). All
+operations are LWW-merged — concurrent edits on the same field
+resolve deterministically by HLC.
 
-* **`ClientGateway`** speaks the browser protocol and only the browser
-  protocol. It cannot dial other Python nodes.
-* **`MeshPubSub`** is an abstract base class. The default driver,
-  `WebSocketMeshPubSub`, speaks WebSocket gossip to other Python nodes.
-  Swap it for a Redis-, NATS-, or in-process implementation without
-  touching anything above.
-* **`MeshNode`** is the only component that knows about CRDT semantics.
-  It receives ops from either side, dedups by HLC, merges into the local
-  replica, and fans the op back out to whichever side it didn't come from.
-* **`ChronoLedger`** is a single-writer task that persists every op to
-  disk asynchronously, with explicit thread-safety guarantees.
+### Markdown editor (`/demos/markdown.html`)
+Each paragraph is a separate CRDT key. Concurrent edits in different
+paragraphs **never** conflict; concurrent edits in the same paragraph
+LWW-merge to the highest-HLC writer's text. Live HTML preview pane
+beside the editor pane. The mini Markdown renderer is vendored and
+HTML-escapes all input — hostile collaborators cannot inject scripts.
 
 ---
 
-## Quick start
+## Documentation
+
+| Guide | Purpose |
+|---|---|
+| [**Getting Started**](docs/getting-started.md) | 10-minute tutorial: clone → working app → understand how state flowed |
+| [**Concepts**](docs/concepts.md) | Mental model: CRDTs, HLCs, tombstones, snapshot vs ledger, what zero-transit means |
+| [**JavaScript API**](docs/api-javascript.md) | Complete reference for the browser-side `Aether` class |
+| [**Python API**](docs/api-python.md) | Complete reference for `MeshNode`, `ClientGateway`, `ChronoLedger`, `SecurityLimits` |
+| [**Recipes**](docs/recipes.md) | Patterns: counters, lists, presence, undo, optimistic UI, schema versioning |
+| [**Deployment**](docs/deployment.md) | Production: nginx/Caddy, Docker, systemd, multi-node federation, scaling |
+| [**Troubleshooting**](docs/troubleshooting.md) | Common errors and fixes |
+| [**SECURITY.md**](SECURITY.md) | Threat model and every applied mitigation |
+| [**BENCHMARKS.md**](BENCHMARKS.md) | Real performance numbers with methodology |
+
+---
+
+## CRDT conflict resolution
+
+Aether-Core is a Last-Writer-Wins map (`LWWMap`) keyed by Hybrid Logical
+Clock (HLC) stamps. The rules:
+
+* **Every write is stamped** with `(physical_time_ns, logical_counter, node_id)`.
+* **Strict total order** — given any two stamps, exactly one is smaller.
+  Tuples compare lexicographically; the `node_id` tiebreaker eliminates
+  ambiguity even when two nodes' clocks read identical nanoseconds.
+* **Merge is `(value, stamp) → max(by stamp)`** — commutative,
+  associative, idempotent. Replays are safe. Out-of-order delivery is
+  safe. Network partitions are safe.
+* **Deletes are tombstones**, not removals. A stale write that says
+  "key X = Y" with a stamp older than the delete is correctly
+  suppressed — deletes cannot be silently reverted.
+
+What this means in practice for the three demo apps:
+
+* **Topology**: dragging the same node from two tabs simultaneously
+  resolves to one final position (the higher HLC wins). The intermediate
+  positions are not interleaved.
+* **Kanban**: two people changing a card's title at the same time
+  resolves to one title. Two people moving the same card to different
+  columns simultaneously resolves to one column. Moving a card while
+  someone else deletes it: the delete tombstone wins if its stamp is
+  higher; otherwise the move wins and the card re-appears in the new
+  column.
+* **Markdown**: two people typing on **different lines** never
+  conflict (each line is its own CRDT key). Two people typing on the
+  **same line** at the same time resolves to one final text — the line
+  is not character-merged. A character-level CRDT would do that, but
+  is out of scope for this engine's "small and provable" charter.
+
+The math is rigorously tested in `python -m aether_core.crdt`, which
+hammers it with randomized concurrent operations and asserts all
+replicas converge byte-for-byte.
+
+---
+
+## Security model
+
+Aether-Core trusts neither browsers nor federated peers. The full
+threat model and every mitigation is in [**SECURITY.md**](SECURITY.md).
+In summary:
+
+* **Per-connection rate limiting** (token bucket, default 100 msg/sec).
+  Connections that overrun are closed, not back-pressured.
+* **Hard payload caps**: 256 KiB WebSocket frame, 64 KiB JSON message,
+  256 byte CRDT key, 32 KiB CRDT value.
+* **Connection caps**: 256 global, 32 per source IP. Excess connections
+  receive WebSocket close code 1013 (Try Again Later).
+* **Slow-loris timeout**: 5 second deadline on the first message
+  after connect.
+* **Tombstones** for deletes — stale writes can't resurrect dead keys.
+* **Crash-safe ledger** with `O_APPEND + fsync` per record and
+  automatic truncation of torn final writes.
+
+All limits are configurable via the `limits=` constructor parameter on
+both `ClientGateway` and `MeshNode`. Defaults are sane for interactive
+collaborative tools; production should re-tune.
+
+---
+
+## Wire protocol
+
+```
+Browser -> gateway:
+    {"type": "set",      "key": "<str>", "value": <json>}
+    {"type": "delete",   "key": "<str>"}
+    {"type": "presence", "x": <int>, "y": <int>}        # ephemeral cursor
+
+Gateway -> browser:
+    {"type": "hello",          "id": "<uuid>", "color": "<hsl>"}    # on connect
+    {"type": "snapshot",       "data": {"<key>": <json>, ...}}      # on connect
+    {"type": "set",            "key": "<str>", "value": <json>}
+    {"type": "delete",         "key": "<str>"}
+    {"type": "presence",       "id": "<uuid>", "color": "<hsl>",
+                               "x": <int>, "y": <int>}
+    {"type": "presence-leave", "id": "<uuid>"}
+```
+
+This block is **automatically enforced** by
+`tests/test_protocol_conformance.py`, which:
+
+1. Asserts the same block exists verbatim in `aether_core/gateway.py`.
+2. Spins up a real gateway and validates the running server emits and
+   accepts every message shape, key, and field type the doc claims.
+
+If you change the wire protocol, the conformance test fails. Doc
+drift is impossible without breaking CI.
+
+---
+
+## Benchmarks (real numbers)
+
+Captured on a Linux VM, Python 3.12.3, fsync ON. Full report and
+methodology in [**BENCHMARKS.md**](BENCHMARKS.md). Reproduce with
+`uv run aether-benchmark`.
+
+| Dimension | Number |
+|---|---|
+| Gateway round-trip (loopback, p50) | **0.21 ms** |
+| Gateway round-trip (loopback, p99) | **0.68 ms** |
+| Ledger replay throughput | **~86,000 ops/sec** |
+| Snapshot-boot speedup | **1.6 – 1.8×** |
+| Mesh convergence (5-node ring, 100 writes) | **63 ms** |
+| Ledger write throughput (with fsync) | **~1,400 ops/sec** |
+
+---
+
+## TypeScript support
+
+A complete `.d.ts` declaration file ships at `web/aether.d.ts` covering
+every method, callback signature, and option. Use via:
+
+```ts
+import type { Aether, AetherOptions } from './aether';
+
+const aether: Aether = new Aether('ws://localhost:8211');
+aether.set<{ x: number, y: number }>('cursor', { x: 100, y: 200 });
+aether.on<number>('counter', (newV, oldV) => { /* ... */ });
+```
+
+The declarations pass `tsc --strict --noEmit` cleanly.
+
+---
+
+## Tests
+
+26 automated tests across multiple test files. Run with:
 
 ```bash
-git clone https://github.com/IronFighter23/aether-core.git
-cd aether-core
-pip install -r requirements.txt
-
-python run_demo.py
+uv run pytest             # 17 Python tests (in-module demos + protocol conformance)
+node test_aether_offline.js   # 9 JS offline-first scenarios
 ```
 
-Open <http://localhost:8080/> in two browser tabs.
+Coverage:
 
-* Click a device in the left palette to add it to the canvas.
-* Drag it around — the other tab follows in real time.
-* Select a device, click **Connect**, then click another device to wire them.
-* Change a link's speed in the right panel — both tabs update instantly.
-* Kill the process (Ctrl+C), restart it, refresh the page — every device
-  and link comes back. State is in `ledger_demo.jsonl`.
-* **Kill the server with devices on screen, then refresh the tab** —
-  the topology still renders from `localStorage`. The browser is now an
-  offline-first cache; the server is the relay/durability tier.
-
----
-
-## Layer-by-layer
-
-### Phase 1 :: CRDT engine (`aether_core/crdt.py`)
-
-The mathematical core. Three primitives:
-
-* **`HybridLogicalClock`** — a triple `(physical_ns, logical, node_id)`
-  forming a strict total order over distributed events. Wall-clock
-  anchored, monotonic across clock skew, and unique per node-pair
-  forever.
-* **`LWWRegister[T]`** — a value plus its HLC stamp plus a tombstone
-  flag. `merge(a, b) = other if other.stamp > self.stamp else self`.
-  Commutative, associative, idempotent.
-* **`LWWMap[K, V]`** — a dict of registers. Deletes are tombstoned,
-  not removed, so late-arriving writes cannot resurrect dead keys.
-
-Run the self-test: `python -m aether_core.crdt`
-
-### Phase 2 :: Mesh PubSub (`aether_core/mesh.py`)
-
-V2 splits this layer into two:
-
-* **`MeshPubSub`** — abstract driver. Defines the federation contract:
-  `start`, `stop`, `connect_to`, `publish`, `set_on_remote_op`,
-  `peer_ids`. Knows nothing about CRDTs.
-* **`WebSocketMeshPubSub`** — the default driver. Epidemic gossip over
-  WebSockets with hello-handshake peer identification and duplicate-
-  channel detection.
-* **`MeshNode`** — the orchestrator that owns a CRDT `Node`, installs
-  itself as the driver's `on_remote_op` handler, dedups by HLC,
-  applies operations to the CRDT, fans out to subscribers, and
-  re-publishes via the driver excluding the sender (epidemic gossip).
-
-```python
-import asyncio
-from aether_core import MeshNode
-
-async def main():
-    alpha = MeshNode("alpha", port=8001)
-    beta  = MeshNode("beta",  port=8002)
-    await alpha.start(); await beta.start()
-    await alpha.connect_to("127.0.0.1", 8002)
-
-    await alpha.set("key", "value")
-    await asyncio.sleep(0.1)
-    assert beta.get("key") == "value"
-
-asyncio.run(main())
-```
-
-To plug in a different transport (e.g. a future Redis driver):
-
-```python
-from aether_core import MeshNode, MeshPubSub
-
-class RedisPubSub(MeshPubSub):
-    async def start(self): ...
-    async def stop(self): ...
-    async def connect_to(self, host, port): ...
-    async def publish(self, op, *, exclude_peer=None): ...
-    @property
-    def peer_ids(self): ...
-    @property
-    def host(self): ...
-    @property
-    def port(self): ...
-
-node = MeshNode("alpha", pubsub=RedisPubSub(...))
-```
-
-Run the self-test (linear topology `alpha ↔ beta ↔ gamma`, no direct
-alpha-gamma link, relay through beta proven, driver-isolation
-asserted): `python -m aether_core.mesh`
-
-### Phase 3 :: Chrono-Vector Storage (`aether_core/storage.py`)
-
-An append-only event ledger. Each operation lands on disk as a single
-JSON line via `os.write()` on an `O_APPEND` file descriptor — atomic
-per record under POSIX guarantees, followed by `fsync()` for durability.
-
-**Thread / task safety in V2:**
-
-* `boot()` and `close()` are guarded by an `asyncio.Lock` so the fd
-  and writer task are managed as one atomic unit. You cannot observe
-  a half-initialised ledger.
-* Exactly **one** writer task. FIFO ordering of disk writes is
-  guaranteed by the underlying `asyncio.Queue`.
-* `os.write` / `os.fsync` run on a worker thread via
-  `asyncio.to_thread` so the event loop never blocks on disk.
-* `on_op()` is fire-and-forget from the caller's perspective. Calling
-  it after `close()` is a safe no-op, never raises.
-* `close()` is idempotent. A second call returns immediately.
-
-**Crash recovery:**
-
-* A torn final line (process killed mid-write) is detected on boot
-  and truncated to the last clean newline. Every fully-flushed
-  record before the crash survives.
-* Mid-file corruption (a non-parseable JSON line in the middle of
-  the ledger) is logged and skipped; replay continues.
-
-Run the self-test (writes, cold-boot, simulated crash recovery,
-post-close safety): `python -m aether_core.storage`
-
-### Phase 4 :: Client Gateway (`aether_core/gateway.py` + `web/aether.js`)
-
-The browser-facing WebSocket endpoint. V2 makes the boundary explicit:
-this file handles browser ↔ server traffic **only**. It cannot speak
-the federation protocol.
-
-* **Snapshot on connect** — new clients immediately receive the
-  current state so they start synchronized, not blank.
-* **Malformed-input safety** — invalid JSON, missing keys, wrong
-  types, all silently dropped. The gateway is a public endpoint and
-  must never crash on bad input. (V2 also catches exceptions from
-  the mesh write path so a bad mutation cannot terminate the client
-  socket.)
-* **Auto-reconnect with exponential backoff** in the JS SDK.
-* **Ephemeral presence relay** — cursor coordinates fly through the
-  gateway but never touch the CRDT or the ledger.
-
-The JS API:
-
-```js
-const aether = new Aether('ws://localhost:8211');
-await aether.ready();                              // first snapshot delivered
-
-aether.set('counter', 42);
-aether.get('counter');                             // -> 42
-aether.delete('counter');
-
-const off = aether.on('counter', (newV, oldV) => { /* ... */ });
-off();                                             // unsubscribe
-
-aether.onAny((key, newV, oldV) => { /* ... */ });
-aether.onStatus(connected => { /* ... */ });
-```
-
-Run the self-test (snapshot delivery, bidirectional sync, late-joiner
-snapshot, delete propagation, malformed-input survival, end-to-end
-persistence): `python -m aether_core.gateway`
-
-### Phase 5 :: Network topology whiteboard (`web/index.html`)
-
-A real application built on the stack. Open in two tabs and you have
-a collaborative editor for enterprise network diagrams — add firewalls,
-switches, NAS units, application servers, routers, load balancers,
-VAPT endpoints and proxies from a palette, drag them around, wire them
-together, label them, change link speeds. Every change propagates live
-to every other tab, persists in the ledger, **and persists to
-`localStorage` for offline-first re-renders**.
-
-State schema:
-
-```
-node:<uuid>:type     "firewall" | "switch" | "nas" | "server" | "router" | "lb" | "vapt" | "proxy"
-node:<uuid>:label    user-editable display name
-node:<uuid>:coords   {x: number, y: number}
-
-link:<uuid>          {from: <uuid>, to: <uuid>, speed: <string>}
-```
-
-No frameworks. No build step. Plain HTML + CSS + vanilla JS.
-
-### Phase 6 :: Log compaction (`aether_core/compact.py`)
-
-The append-only ledger grows forever. After tens of thousands of
-operations, boot-time replay slows down. `compact.py` is an offline
-worker that folds the ledger into a condensed
-`<ledger>.snapshot.json` containing the final value (or tombstone)
-for each key, plus the HLC stamp that produced it.
-
-```bash
-python -m aether_core.compact ledger_demo.jsonl
-python -m aether_core.compact ledger_demo.jsonl --rotate
-```
-
-`ChronoLedger.boot()` auto-detects the snapshot and replays only ops
-newer than its `max_stamp`. Boot time becomes
-O(records-since-last-compact) instead of O(records-ever-written).
+* `tests/test_in_module_demos.py` — wraps the 5 in-module `_demo()`
+  routines (CRDT convergence, mesh sync, ledger crash recovery,
+  gateway snapshot+sync+malformed+oversize, log compaction).
+* `tests/test_protocol_conformance.py` — 12 tests validating the wire
+  protocol matches the documentation, plus rate-limit / oversize-key /
+  oversize-value enforcement against a live server.
+* `test_aether_offline.js` — 9 scenarios validating the
+  browser-side offline-first persistence layer.
 
 ---
 
@@ -319,53 +290,50 @@ O(records-since-last-compact) instead of O(records-ever-written).
 
 ```
 aether-core/
-├── aether_core/          Python package
-│   ├── __init__.py       (public API)
-│   ├── crdt.py           CRDT math
-│   ├── mesh.py           MeshPubSub driver + MeshNode orchestrator
-│   ├── storage.py        Append-only ledger (snapshot-aware)
-│   ├── gateway.py        ClientGateway (browser bridge)
-│   └── compact.py        Log compaction worker
-├── web/                  Browser-facing assets
-│   ├── aether.js         Vanilla JS SDK with localStorage cache
-│   └── index.html        Topology whiteboard
-├── run_demo.py           End-to-end launcher
-├── requirements.txt
+├── pyproject.toml             ← uv / hatch packaging
+├── README.md
+├── SECURITY.md                ← threat model + mitigations
+├── BENCHMARKS.md              ← real numbers + methodology
 ├── LICENSE
-└── README.md
+├── run_demo.py                ← launches all three demos
+├── test_aether_offline.js     ← JS offline-first tests
+├── aether_core/
+│   ├── __init__.py
+│   ├── cli.py                 ← entry points: aether-demo, aether-benchmark
+│   ├── _security.py           ← token bucket, conn counter, validators
+│   ├── crdt.py                ← LWWMap + HLC
+│   ├── mesh.py                ← MeshPubSub abstract + WebSocket impl
+│   ├── gateway.py             ← browser-facing relay (hardened)
+│   ├── storage.py             ← append-only ledger
+│   └── compact.py             ← log compaction worker
+├── benchmarks/
+│   ├── run_benchmarks.py      ← reproducible benchmark suite
+│   └── results.json           ← latest run output
+├── docs/
+│   ├── README.md              ← documentation index
+│   ├── getting-started.md     ← 10-minute tutorial
+│   ├── concepts.md            ← mental model
+│   ├── api-javascript.md      ← browser client reference
+│   ├── api-python.md          ← relay reference
+│   ├── recipes.md             ← common patterns
+│   ├── deployment.md          ← production guide
+│   └── troubleshooting.md     ← common issues + fixes
+├── tests/
+│   ├── test_in_module_demos.py
+│   └── test_protocol_conformance.py
+└── web/
+    ├── aether.js              ← browser client (offline-first cache)
+    ├── aether.d.ts            ← TypeScript declarations
+    ├── index.html             ← topology demo
+    └── demos/
+        ├── kanban.html        ← Kanban demo
+        └── markdown.html      ← Markdown demo
 ```
-
----
-
-## Running the tests
-
-```bash
-python -m aether_core.crdt       # CRDT convergence
-python -m aether_core.mesh       # mesh sync + driver isolation
-python -m aether_core.storage    # ledger + crash recovery + post-close safety
-python -m aether_core.gateway    # gateway + malformed-input survival
-python -m aether_core.compact    # log compaction + snapshot boot
-```
-
-All five exit 0 on success.
-
----
-
-## Design constraints, honoured
-
-* **No external databases.** Not SQLite, not Postgres, not Redis. State
-  is variables; history is an `os.write()`-ed JSON-lines file.
-* **No centralized server.** Every Python node is a peer; every browser
-  tab is a thin client of a peer.
-* **No JS frameworks.** No React, Vue, Tailwind, jQuery, or build step.
-* **Pure stdlib + websockets.** Python depends only on `websockets>=11.0.3`.
 
 ---
 
 ## License
 
-MIT — see [`LICENSE`](LICENSE).
-
----
+MIT — see [LICENSE](LICENSE).
 
 Built by **Nishant Bhatte** · [@IronFighter23](https://github.com/IronFighter23)

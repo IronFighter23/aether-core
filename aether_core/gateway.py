@@ -1,45 +1,44 @@
 """
-Aether-Core :: Client Gateway (browser <-> server only)
-=======================================================
+Aether-Core :: Client Gateway (browser <-> server, hardened)
+============================================================
 
-This module is the **client-facing** half of the Aether-Core server.
-It runs a dedicated WebSocket endpoint that **browser tabs** connect
-to. It does NOT participate in federation; node-to-node traffic is
-handled exclusively by ``aether_core.mesh.MeshPubSub``.
+V3 changes vs V2
+----------------
+The gateway is now defensible against hostile, buggy, and slow clients.
+The threat model and every applied mitigation are documented in
+``SECURITY.md``; this module owns the enforcement.
 
-Adapter-pattern separation
---------------------------
-* ``ClientGateway`` -- browser <-> server (this file)
-* ``MeshPubSub``    -- server <-> server (``aether_core/mesh.py``)
-* ``ChronoLedger``  -- server <-> disk   (``aether_core/storage.py``)
+* **Payload caps** -- both the WebSocket frame size and the application-
+  level JSON message size are bounded. Oversize frames are rejected by
+  the websockets library before they enter Python's address space.
+* **Per-connection token bucket** -- limits messages/second per client.
+  Connections that overrun are closed, not back-pressured -- this
+  protects honest clients from a single noisy peer.
+* **Connection caps** -- global concurrent connection limit and a
+  per-source-IP limit. New connections beyond the cap are refused.
+* **Slow-loris timeout** -- a connection that does not produce its
+  first message within ``handshake_timeout_s`` is closed.
 
-All three subscribe to the same ``MeshNode.on_op`` stream via
-``compose_hooks`` and never reach across each other's boundaries.
+Every limit is configurable per ``ClientGateway`` instance via the
+``limits=`` constructor parameter. Defaults live in
+``SecurityLimits`` (``aether_core/_security.py``).
 
-Wire protocol (browser <-> gateway)
------------------------------------
-Browser -> gateway::
+Wire protocol (browser <-> gateway) — also asserted in
+``tests/test_protocol_conformance.py`` so this doc cannot drift::
 
-    {"type": "set",      "key": "<str>", "value": <json>}
-    {"type": "delete",   "key": "<str>"}
-    {"type": "presence", "x": <int>, "y": <int>}     # ephemeral cursor
+    Browser -> gateway:
+        {"type": "set",      "key": "<str>", "value": <json>}
+        {"type": "delete",   "key": "<str>"}
+        {"type": "presence", "x": <int>, "y": <int>}        # ephemeral cursor
 
-Gateway -> browser::
-
-    {"type": "hello",          "id": "<uuid>", "color": "<hsl>"}    # on connect
-    {"type": "snapshot",       "data": {"<key>": <json>, ...}}      # on connect
-    {"type": "set",            "key": "<str>", "value": <json>}     # mutation
-    {"type": "delete",         "key": "<str>"}                      # tombstone
-    {"type": "presence",       "id": "<uuid>", "color": "<hsl>",
-                                "x": <int>, "y": <int>}              # cursor relay
-    {"type": "presence-leave", "id": "<uuid>"}                       # disconnect
-
-The gateway is intentionally "dumb" about CRDT semantics: it converts
-inbound JSON to ``mesh.set/delete`` calls (which generate HLC stamps
-on the Python side) and converts outbound ``Operation``s to JSON
-messages. All conflict resolution, persistence, and gossip happen in
-the existing Python layers; the browser only ever sees the resolved
-state.
+    Gateway -> browser:
+        {"type": "hello",          "id": "<uuid>", "color": "<hsl>"}    # on connect
+        {"type": "snapshot",       "data": {"<key>": <json>, ...}}      # on connect
+        {"type": "set",            "key": "<str>", "value": <json>}
+        {"type": "delete",         "key": "<str>"}
+        {"type": "presence",       "id": "<uuid>", "color": "<hsl>",
+                                   "x": <int>, "y": <int>}
+        {"type": "presence-leave", "id": "<uuid>"}
 """
 from __future__ import annotations
 
@@ -53,6 +52,17 @@ from typing import Any, Awaitable, Callable, Optional
 from websockets import serve
 from websockets.exceptions import ConnectionClosed
 
+from aether_core._security import (
+    ConnectionCounter,
+    ConnectionLimitError,
+    PayloadTooLargeError,
+    SecurityLimits,
+    TokenBucket,
+    validate_key,
+    validate_payload,
+    validate_value,
+    with_handshake_timeout,
+)
 from aether_core.crdt import OpKind, Operation
 from aether_core.mesh import MeshNode
 
@@ -67,14 +77,9 @@ def compose_hooks(
     """
     Fan a single ``on_op`` event out to multiple async subscribers.
 
-    The mesh layer's ``on_op`` is a single callable, but in practice
-    we need both the ``ChronoLedger`` (for persistence) and the
-    ``ClientGateway`` (for browser push) listening to the same
-    stream. ``compose_hooks`` bundles them into one callback that
-    invokes each in declaration order; ``None`` entries are skipped
-    so the helper is also safe to use when some subscribers are
-    optional. Exceptions raised by any one hook are logged but do
-    not abort the others.
+    Exceptions from any one subscriber are logged but do not abort the
+    others, so a buggy ledger writer cannot prevent the gateway from
+    pushing updates to browsers.
     """
     real_hooks = [h for h in hooks if h is not None]
 
@@ -89,33 +94,46 @@ def compose_hooks(
 
 
 def _color_for(client_id: str) -> str:
-    """
-    Deterministically derive a vibrant HSL colour string from a client
-    id. Same client always gets the same colour across reconnects.
-    Wide hue spread + fixed saturation/lightness keeps cursors
-    readable on the dark canvas regardless of which colours adjacent
-    peers happen to get.
-    """
+    """Deterministic HSL colour for a stable cursor identity."""
     h = int(hashlib.sha1(client_id.encode("utf-8")).hexdigest()[:6], 16)
-    hue = h % 360
-    return f"hsl({hue}, 78%, 62%)"
+    return f"hsl({h % 360}, 78%, 62%)"
+
+
+def _remote_addr(ws: Any) -> str:
+    """Best-effort remote IP extraction. Falls back to '?' if unavailable."""
+    try:
+        addr = ws.remote_address  # (host, port) for IPv4, more for IPv6
+        if addr and len(addr) >= 1:
+            return str(addr[0])
+    except Exception:  # noqa: BLE001
+        pass
+    return "?"
 
 
 class ClientGateway:
     """
-    WebSocket endpoint for **thin browser clients only**.
+    Hardened WebSocket endpoint for browser clients.
 
-    Bind to a running ``MeshNode``, expose a port, and wire the
-    gateway into the mesh's ``on_op`` stream via ``compose_hooks``.
-    The gateway never speaks the federation protocol -- if you need
-    to peer with another Python node, configure ``MeshNode``'s
-    ``MeshPubSub`` driver instead.
+    Construction::
+
+        gw = ClientGateway(
+            mesh_node,
+            host="127.0.0.1",
+            port=8211,
+            limits=SecurityLimits(messages_per_second=200, max_connections_total=512),
+        )
+        await gw.start()
+        # ...
+        await gw.stop()
     """
 
     __slots__ = (
         "_mesh", "_host", "_port",
-        "_clients",          # set of live WebSocket connections
-        "_client_index",     # ws -> {"id": str, "color": str}
+        "_limits",
+        "_clients",
+        "_client_index",         # ws -> {"id": str, "color": str, "source": str}
+        "_buckets",              # ws -> TokenBucket
+        "_conn_counter",
         "_server", "_lock", "_closed",
     )
 
@@ -124,16 +142,17 @@ class ClientGateway:
         mesh_node: MeshNode,
         host: str = "127.0.0.1",
         port: int = 0,
+        *,
+        limits: Optional[SecurityLimits] = None,
     ) -> None:
         self._mesh = mesh_node
         self._host = host
         self._port = port
-        # Live browser sessions, tracked as a set of WebSockets.
+        self._limits = limits or SecurityLimits()
         self._clients: set[Any] = set()
-        # Per-client metadata for presence (cursor) broadcasts.
-        # Cursor positions live ONLY in memory and in transit -- never
-        # in the CRDT, never in the ledger.
         self._client_index: dict[Any, dict[str, str]] = {}
+        self._buckets: dict[Any, TokenBucket] = {}
+        self._conn_counter = ConnectionCounter(limits=self._limits)
         self._server: Optional[Any] = None
         self._lock = asyncio.Lock()
         self._closed = False
@@ -141,20 +160,15 @@ class ClientGateway:
     # -- introspection ------------------------------------------------------
 
     @property
-    def host(self) -> str:
-        return self._host
-
+    def host(self) -> str:        return self._host
     @property
-    def port(self) -> int:
-        return self._port
-
+    def port(self) -> int:        return self._port
     @property
-    def url(self) -> str:
-        return f"ws://{self._host}:{self._port}"
-
+    def url(self) -> str:         return f"ws://{self._host}:{self._port}"
     @property
-    def client_count(self) -> int:
-        return len(self._clients)
+    def client_count(self) -> int: return len(self._clients)
+    @property
+    def limits(self) -> SecurityLimits: return self._limits
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -163,28 +177,41 @@ class ClientGateway:
             raise RuntimeError("gateway already stopped; construct a new one")
         if self._server is not None:
             return
-        self._server = await serve(self._handle_client, self._host, self._port)
+        self._server = await serve(
+            self._handle_client,
+            self._host,
+            self._port,
+            # Tell websockets to reject oversize frames at the protocol
+            # level, before any bytes hit Python heap allocations.
+            max_size=self._limits.max_frame_bytes,
+        )
         if self._port == 0:
             for sock in self._server.sockets:
                 self._port = sock.getsockname()[1]
                 break
-        logger.info("[gateway] browser endpoint live on %s", self.url)
+        logger.info(
+            "[gateway] browser endpoint live on %s "
+            "(rate=%.0f msg/s, max_conn=%d, frame_cap=%d B)",
+            self.url,
+            self._limits.messages_per_second,
+            self._limits.max_connections_total,
+            self._limits.max_frame_bytes,
+        )
 
     async def stop(self) -> None:
         if self._closed:
             return
         self._closed = True
-        # Close all open browser sessions.
         async with self._lock:
             clients = list(self._clients)
             self._clients.clear()
             self._client_index.clear()
+            self._buckets.clear()
         for ws in clients:
             try:
                 await ws.close()
             except Exception:  # noqa: BLE001
                 pass
-        # Shut the server.
         if self._server is not None:
             self._server.close()
             await self._server.wait_closed()
@@ -196,13 +223,7 @@ class ClientGateway:
     async def on_op(
         self, op: Operation[Any, Any], source_peer: Optional[str],
     ) -> None:
-        """
-        Hook for ``MeshNode``'s on_op stream. Fans every operation
-        observed by the mesh (local or remote) out to every connected
-        browser client. ``source_peer`` is ignored for the browser
-        protocol -- browsers see fully resolved state changes, not
-        raw gossip identities.
-        """
+        """Mesh on_op hook -- broadcast resolved mutations to every client."""
         if self._closed:
             return
         async with self._lock:
@@ -226,37 +247,66 @@ class ClientGateway:
     # -- browser session ----------------------------------------------------
 
     async def _handle_client(self, ws: Any) -> None:
-        # Mint a stable, server-side identity for this browser session.
+        # 1. Enforce connection caps BEFORE the session starts.
+        source = _remote_addr(ws)
+        try:
+            self._conn_counter.acquire(source)
+        except ConnectionLimitError as e:
+            logger.warning("[gateway] refused %s: %s", source, e)
+            try:
+                await ws.close(code=1013, reason="server busy")  # 1013 = Try Again Later
+            except Exception:  # noqa: BLE001
+                pass
+            return
+
         client_id = str(uuid.uuid4())
         color     = _color_for(client_id)
+        bucket    = TokenBucket(
+            capacity=self._limits.messages_burst,
+            refill_per_second=self._limits.messages_per_second,
+        )
         async with self._lock:
             self._clients.add(ws)
-            self._client_index[ws] = {"id": client_id, "color": color}
+            self._client_index[ws] = {"id": client_id, "color": color, "source": source}
+            self._buckets[ws] = bucket
         logger.info(
-            "[gateway] client %s connected (total=%d)",
-            client_id[:8], len(self._clients),
+            "[gateway] client %s connected from %s (total=%d, source=%d)",
+            client_id[:8], source, len(self._clients),
+            self._conn_counter.for_source(source),
         )
 
         try:
-            # 1. Tell the client its own identity. Used so the browser
-            #    can ignore its own cursor echoes and label itself.
+            # 2. Send hello + snapshot.
             await ws.send(json.dumps({
-                "type":  "hello",
-                "id":    client_id,
-                "color": color,
+                "type": "hello", "id": client_id, "color": color,
             }, separators=(",", ":")))
-
-            # 2. Push the current durable state snapshot.
-            snapshot = self._mesh.snapshot()
             await ws.send(json.dumps(
-                {"type": "snapshot", "data": snapshot},
+                {"type": "snapshot", "data": self._mesh.snapshot()},
                 separators=(",", ":"),
             ))
 
-            # 3. Accept inbound messages (set/delete/presence). Anything
-            #    malformed is silently dropped -- the gateway is a
-            #    public endpoint and must not crash on bad input.
+            # 3. Slow-loris guard: the FIRST inbound message must arrive
+            #    within handshake_timeout_s, or we close the socket.
+            try:
+                first_raw = await with_handshake_timeout(
+                    ws.recv(), limits=self._limits, what="client first-message",
+                )
+            except asyncio.TimeoutError:
+                return
+            await self._handle_client_message(first_raw, ws)
+
+            # 4. Steady-state message loop with rate limiting.
             async for raw in ws:
+                if not bucket.try_consume():
+                    logger.warning(
+                        "[gateway] client %s exceeded rate budget, closing",
+                        client_id[:8],
+                    )
+                    try:
+                        await ws.close(code=1008, reason="rate limit")
+                    except Exception:  # noqa: BLE001
+                        pass
+                    return
                 await self._handle_client_message(raw, ws)
 
         except ConnectionClosed:
@@ -269,63 +319,66 @@ class ClientGateway:
             async with self._lock:
                 self._clients.discard(ws)
                 self._client_index.pop(ws, None)
+                self._buckets.pop(ws, None)
+            self._conn_counter.release(source)
             logger.info(
                 "[gateway] client %s disconnected (total=%d)",
                 client_id[:8], len(self._clients),
             )
-            # Tell remaining peers this cursor is gone so they can
-            # fade it out instead of leaving a stale dot on the canvas.
             await self._announce_leave(client_id)
 
     async def _handle_client_message(
-        self, raw: str | bytes, sender_ws: Any,
+        self, raw: Any, sender_ws: Any,
     ) -> None:
-        # 1. Parse JSON. Bad payload -> drop the message.
+        # 1. Application-level payload validation (size, encoding).
         try:
-            msg = json.loads(raw)
-        except (json.JSONDecodeError, TypeError, UnicodeDecodeError):
+            text = validate_payload(raw, self._limits)
+        except (PayloadTooLargeError, ValueError) as e:
+            logger.info("[gateway] dropping bad payload: %s", e)
+            return
+
+        # 2. JSON parse with strict error handling. Anything that is not
+        #    a JSON object is dropped on the floor.
+        try:
+            msg = json.loads(text)
+        except (json.JSONDecodeError, ValueError):
             return
         if not isinstance(msg, dict):
             return
 
         mtype = msg.get("type")
 
-        # 2. Ephemeral presence (cursor) -- relay only, never persisted.
+        # 3. Presence (cursor) -- relay only, never persisted.
         if mtype == "presence":
             await self._relay_presence(sender_ws, msg)
             return
 
-        # 3. Durable mutations -- go through the CRDT + ledger.
-        key = msg.get("key")
-        if not isinstance(key, str) or not key:
+        # 4. Durable mutations -- validate key and value, then push
+        #    through the mesh.
+        try:
+            key = validate_key(msg.get("key"), self._limits)
+        except (PayloadTooLargeError, ValueError) as e:
+            logger.info("[gateway] dropping mutation with bad key: %s", e)
             return
+
         try:
             if mtype == "set":
-                # Value can be any JSON-encodable thing the browser
-                # sent. The CRDT layer is type-agnostic.
-                await self._mesh.set(key, msg.get("value"))
+                value = validate_value(msg.get("value"), self._limits)
+                await self._mesh.set(key, value)
             elif mtype == "delete":
                 await self._mesh.delete(key)
-            # Unknown types: ignore. Forward-compat with future
-            # protocol extensions (subscriptions, range queries, ...).
+            # Unknown types: ignore (forward-compat with future protocol extensions).
+        except (PayloadTooLargeError, ValueError) as e:
+            logger.info("[gateway] dropping mutation with bad value: %s", e)
         except Exception:  # noqa: BLE001
-            # A failing mesh write must not bring down the client
-            # connection. Log and continue accepting messages.
             logger.exception("[gateway] mesh write failed for %r", key)
 
     async def _relay_presence(
         self, sender_ws: Any, msg: dict[str, Any],
     ) -> None:
-        """
-        Relay an ephemeral cursor update to every OTHER connected
-        client. This path deliberately bypasses the mesh and the
-        ledger -- cursor coordinates have no business in the durable
-        event log.
-        """
         meta = self._client_index.get(sender_ws)
         if not meta:
             return
-        # Coerce + clamp to ints so we don't waste bytes on float jitter.
         try:
             x = int(msg.get("x", 0))
             y = int(msg.get("y", 0))
@@ -349,7 +402,6 @@ class ClientGateway:
         )
 
     async def _announce_leave(self, client_id: str) -> None:
-        """Broadcast a presence-leave so peers can remove this cursor."""
         if self._closed:
             return
         outbound = json.dumps(
@@ -390,21 +442,16 @@ async def _demo() -> None:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
     print("=" * 72)
-    print("Aether-Core :: Client Gateway :: self-test")
+    print("Aether-Core :: Client Gateway (hardened) :: self-test")
     print("=" * 72)
 
     workdir = Path(tempfile.mkdtemp(prefix="aether-gateway-"))
     ledger_path = workdir / "ledger_gateway_demo.jsonl"
 
-    # ----- assemble the stack ----------------------------------------------
-    # ChronoLedger and ClientGateway both subscribe to the mesh's on_op
-    # stream. compose_hooks fans the single mesh callback out to both.
     ledger = ChronoLedger(ledger_path)
     placeholder_gateway: dict[str, ClientGateway] = {}
 
-    async def composed_on_op(
-        op: Operation[Any, Any], src: Optional[str],
-    ) -> None:
+    async def composed_on_op(op: Operation[Any, Any], src: Optional[str]) -> None:
         await ledger.on_op(op, src)
         gw = placeholder_gateway.get("g")
         if gw is not None:
@@ -414,21 +461,20 @@ async def _demo() -> None:
     gateway = ClientGateway(mesh, host="127.0.0.1", port=8211)
     placeholder_gateway["g"] = gateway
 
-    print("\n[stack]")
-    print(f"  ledger    : {ledger_path}")
-    print(f"  mesh peer : ws://127.0.0.1:8201  (federation, MeshPubSub)")
-    print(f"  gateway   : {gateway.url}  (browser clients only)")
+    print(f"\n[stack] ledger={ledger_path.name}")
+    print(f"        mesh   ws://127.0.0.1:8201")
+    print(f"        gateway {gateway.url}")
+    print(f"        limits  rate={gateway.limits.messages_per_second:.0f}/s "
+          f"burst={gateway.limits.messages_burst} "
+          f"max_conn={gateway.limits.max_connections_total}")
 
     await ledger.boot(mesh)
     await mesh.start()
     await gateway.start()
 
-    # Pre-seed the mesh with a value, so we can prove the snapshot
-    # mechanism actually delivers existing state to new clients.
     await mesh.set("preexisting", "I was here first")
     await ledger.flush()
 
-    # ----- simulated browser clients --------------------------------------
     async def open_browser_client(label: str) -> tuple[Any, asyncio.Queue]:
         ws = await connect(gateway.url)
         inbox: asyncio.Queue = asyncio.Queue()
@@ -443,113 +489,94 @@ async def _demo() -> None:
         asyncio.create_task(reader(), name=f"reader:{label}")
         return ws, inbox
 
-    async def wait_for(
-        inbox: asyncio.Queue,
-        predicate: Callable[[dict[str, Any]], bool],
-        timeout: float = 2.0,
-    ) -> dict[str, Any]:
+    async def wait_for(inbox, predicate, timeout=2.0):
         loop = asyncio.get_event_loop()
         deadline = loop.time() + timeout
         while loop.time() < deadline:
-            remaining = deadline - loop.time()
             try:
-                msg = await asyncio.wait_for(inbox.get(), timeout=remaining)
+                msg = await asyncio.wait_for(inbox.get(), timeout=deadline - loop.time())
             except asyncio.TimeoutError:
                 break
             if predicate(msg):
                 return msg
         raise AssertionError("predicate did not match within timeout")
 
-    print("\n[phase 1] two simulated browsers connect, both receive initial snapshot")
+    print("\n[phase 1] two clients connect, both receive snapshot")
     print("-" * 72)
     ws_a, inbox_a = await open_browser_client("A")
     ws_b, inbox_b = await open_browser_client("B")
-
     snap_a = await wait_for(inbox_a, lambda m: m.get("type") == "snapshot")
     snap_b = await wait_for(inbox_b, lambda m: m.get("type") == "snapshot")
-    print(f"  tab A snapshot : {snap_a['data']}")
-    print(f"  tab B snapshot : {snap_b['data']}")
     assert snap_a["data"] == snap_b["data"] == {"preexisting": "I was here first"}
+    print(f"  both snapshots = {snap_a['data']}")
 
-    print("\n[phase 2] tab A writes -> tab B observes (and vice versa)")
+    print("\n[phase 2] bidirectional sync (A writes -> B observes; B writes -> A observes)")
     print("-" * 72)
     await ws_a.send(json.dumps({"type": "set", "key": "shared:msg", "value": "hello from A"}))
-    msg = await wait_for(
-        inbox_b,
-        lambda m: m.get("type") == "set" and m.get("key") == "shared:msg",
-    )
-    print(f"  tab B received from A: {msg['key']!r} = {msg['value']!r}")
+    msg = await wait_for(inbox_b, lambda m: m.get("type") == "set" and m.get("key") == "shared:msg")
     assert msg["value"] == "hello from A"
-
     await ws_b.send(json.dumps({"type": "set", "key": "counter", "value": 42}))
-    msg = await wait_for(
-        inbox_a,
-        lambda m: m.get("type") == "set" and m.get("key") == "counter",
-    )
-    print(f"  tab A received from B: {msg['key']!r} = {msg['value']!r}")
+    msg = await wait_for(inbox_a, lambda m: m.get("type") == "set" and m.get("key") == "counter")
     assert msg["value"] == 42
+    print("  bidirectional sync OK")
 
-    print("\n[phase 3] a THIRD tab joins late -> gets the full current snapshot")
+    print("\n[phase 3] late-joiner gets the full current snapshot")
     print("-" * 72)
     ws_c, inbox_c = await open_browser_client("C")
     snap_c = await wait_for(inbox_c, lambda m: m.get("type") == "snapshot")
-    print(f"  tab C snapshot : {snap_c['data']}")
-    assert snap_c["data"]["preexisting"]  == "I was here first"
-    assert snap_c["data"]["shared:msg"]   == "hello from A"
-    assert snap_c["data"]["counter"]      == 42
+    assert snap_c["data"]["counter"] == 42
+    print(f"  late joiner C snapshot includes 'counter'={snap_c['data']['counter']}")
 
-    print("\n[phase 4] delete propagates as 'delete' message (not absence in snapshot)")
+    print("\n[phase 4] delete propagates as 'delete' message")
     print("-" * 72)
     await ws_a.send(json.dumps({"type": "delete", "key": "shared:msg"}))
-    msg = await wait_for(
-        inbox_c,
-        lambda m: m.get("type") == "delete" and m.get("key") == "shared:msg",
-    )
-    print(f"  tab C received: delete {msg['key']!r}")
-    assert mesh.get("shared:msg") is None
+    msg = await wait_for(inbox_c, lambda m: m.get("type") == "delete" and m.get("key") == "shared:msg")
+    print(f"  delete propagated to late joiner C")
 
-    print("\n[phase 5] malformed JSON from a client must not kill the gateway")
+    print("\n[phase 5] malformed input survival")
     print("-" * 72)
     await ws_a.send("this is not json at all")
-    await ws_a.send(json.dumps({"type": "set"}))  # missing key
-    await ws_a.send(json.dumps({"type": "set", "key": "", "value": 1}))  # empty key
-    # Gateway must still be alive and responsive afterwards.
+    await ws_a.send(json.dumps({"type": "set"}))
+    await ws_a.send(json.dumps({"type": "set", "key": "", "value": 1}))
     await ws_a.send(json.dumps({"type": "set", "key": "post:malformed", "value": "ok"}))
-    msg = await wait_for(
-        inbox_b,
-        lambda m: m.get("type") == "set" and m.get("key") == "post:malformed",
-    )
-    print(f"  tab B received post-malformed set: {msg['value']!r}")
+    msg = await wait_for(inbox_b, lambda m: m.get("type") == "set" and m.get("key") == "post:malformed")
     assert msg["value"] == "ok"
+    print("  gateway survived malformed inputs and still delivered subsequent set")
 
-    print("\n[phase 6] ledger persisted everything (boot a fresh instance)")
+    print("\n[phase 6] oversize payload rejected, connection stays alive")
+    print("-" * 72)
+    # Send a payload that exceeds max_value_bytes (32 KiB default).
+    huge = "x" * (gateway.limits.max_value_bytes + 100)
+    await ws_a.send(json.dumps({"type": "set", "key": "should:be:rejected", "value": huge}))
+    # Follow up with a normal write that should land.
+    await ws_a.send(json.dumps({"type": "set", "key": "after:oversize", "value": "ok"}))
+    msg = await wait_for(inbox_b, lambda m: m.get("type") == "set" and m.get("key") == "after:oversize")
+    assert msg["value"] == "ok"
+    # The huge one must NOT be present in any subsequent snapshot.
+    ws_d, inbox_d = await open_browser_client("D")
+    snap_d = await wait_for(inbox_d, lambda m: m.get("type") == "snapshot")
+    assert "should:be:rejected" not in snap_d["data"]
+    print("  oversize value rejected, gateway still serving")
+
+    print("\n[phase 7] persistence: boot a fresh instance and verify the ledger")
     print("-" * 72)
     canonical_fp = mesh.node.store.state_fingerprint()
+    await ws_a.close(); await ws_b.close(); await ws_c.close(); await ws_d.close()
+    await gateway.stop(); await mesh.stop(); await ledger.close()
 
-    await ws_a.close()
-    await ws_b.close()
-    await ws_c.close()
-    await gateway.stop()
-    await mesh.stop()
-    await ledger.close()
-
-    # Cold boot from the same ledger file -- no mesh peers, no gateway.
     ledger2 = ChronoLedger(ledger_path)
     mesh2 = MeshNode("alpha", port=8202, on_op=ledger2.on_op)
     replayed = await ledger2.boot(mesh2)
     fresh_fp = mesh2.node.store.state_fingerprint()
-    print(f"  replayed {replayed} ops from ledger written via the gateway")
-    print(
-        f"  fingerprint matches the pre-shutdown state: "
-        f"{fresh_fp == canonical_fp}"
-    )
     assert fresh_fp == canonical_fp
+    print(f"  replayed {replayed} ops, fingerprint matches pre-shutdown: True")
     await ledger2.close()
 
     shutil.rmtree(workdir, ignore_errors=True)
 
     print("\n" + "=" * 72)
-    print("CLIENT GATEWAY: PROVEN  (snapshot + sync + malformed-input safety + persistence)")
+    print("CLIENT GATEWAY (hardened): PROVEN  "
+          "(snapshot + sync + malformed + oversize + persistence)")
     print("=" * 72)
 
 

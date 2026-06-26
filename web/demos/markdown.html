@@ -1,0 +1,707 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Aether-Core · Markdown</title>
+<style>
+:root {
+  --bg-0: #0d1117;
+  --bg-1: #161b22;
+  --bg-2: #1f2933;
+  --bg-3: #2a3441;
+  --border: #30363d;
+  --text: #e6edf3;
+  --text-dim: #8b949e;
+  --accent: #58a6ff;
+  --accent-dim: rgba(88,166,255,0.12);
+  --green: #56d364;
+  --red: #f85149;
+  --radius: 8px;
+  --font: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --mono: ui-monospace, "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; height: 100%; }
+body {
+  background: var(--bg-0);
+  color: var(--text);
+  font-family: var(--font);
+  font-size: 14px;
+  line-height: 1.5;
+  overflow: hidden;
+}
+.app { display: flex; flex-direction: column; height: 100vh; }
+header {
+  display: flex; align-items: center; gap: 16px;
+  padding: 10px 16px; background: var(--bg-1);
+  border-bottom: 1px solid var(--border); flex-shrink: 0;
+}
+header .title { font-weight: 600; font-size: 15px; }
+header .title .badge {
+  font-size: 11px; font-weight: 500; background: var(--accent-dim);
+  color: var(--accent); padding: 2px 7px; border-radius: 4px;
+  margin-left: 8px; font-family: var(--mono);
+}
+header .spacer { flex: 1; }
+header .status {
+  font-size: 12px; color: var(--text-dim);
+  display: flex; align-items: center; gap: 6px; font-family: var(--mono);
+}
+header .status .dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--red); transition: background 0.2s;
+}
+header .status.connected .dot { background: var(--green); }
+header button {
+  background: var(--bg-2); color: var(--text);
+  border: 1px solid var(--border); padding: 6px 12px; border-radius: 6px;
+  font-family: var(--font); font-size: 13px; cursor: pointer;
+}
+header button:hover { background: var(--bg-3); border-color: var(--accent); }
+header .peers {
+  display: flex; gap: 4px; align-items: center;
+  font-family: var(--mono); font-size: 11px; color: var(--text-dim);
+}
+header .peer-dot {
+  width: 18px; height: 18px; border-radius: 50%;
+  border: 2px solid var(--bg-1);
+  margin-left: -6px;
+}
+
+main {
+  flex: 1; display: grid; grid-template-columns: 1fr 1fr;
+  min-height: 0;
+}
+.pane {
+  display: flex; flex-direction: column;
+  background: var(--bg-1);
+  min-height: 0;
+}
+.pane + .pane { border-left: 1px solid var(--border); }
+.pane-head {
+  padding: 8px 14px;
+  font-size: 11px;
+  font-family: var(--mono);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-dim);
+  background: var(--bg-1);
+  border-bottom: 1px solid var(--border);
+}
+.editor {
+  flex: 1; overflow-y: auto; padding: 16px 22px;
+  background: var(--bg-1);
+}
+.preview {
+  flex: 1; overflow-y: auto; padding: 22px 28px;
+  background: var(--bg-0);
+}
+
+/* Editor lines */
+.line {
+  position: relative;
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+.line + .line { margin-top: 1px; }
+.line .gutter {
+  width: 22px; flex-shrink: 0; padding-top: 4px;
+  text-align: right;
+  font-family: var(--mono); font-size: 11px; color: var(--text-dim);
+  opacity: 0.5; user-select: none;
+}
+.line .input {
+  flex: 1;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  padding: 3px 7px;
+  font-family: var(--mono);
+  font-size: 13px;
+  line-height: 1.55;
+  color: var(--text);
+  outline: none;
+  width: 100%;
+  resize: none;
+  overflow: hidden;
+  min-height: 1.6em;
+  font-feature-settings: "calt" 1;
+}
+.line .input:focus { border-color: var(--accent); background: rgba(88,166,255,0.04); }
+.line .input::placeholder { color: var(--text-dim); opacity: 0.4; }
+.line .ctrls {
+  display: flex; gap: 2px; opacity: 0; transition: opacity 0.1s;
+  padding-top: 4px;
+}
+.line:hover .ctrls, .line:focus-within .ctrls { opacity: 1; }
+.line .ctrls button {
+  background: transparent; border: 1px solid var(--border);
+  color: var(--text-dim); padding: 0 6px; height: 22px;
+  border-radius: 4px; cursor: pointer; font-size: 11px;
+  font-family: var(--mono);
+}
+.line .ctrls button:hover { color: var(--accent); border-color: var(--accent); }
+
+.add-line {
+  margin-top: 6px;
+  width: 100%;
+  background: transparent;
+  border: 1px dashed var(--border);
+  color: var(--text-dim);
+  padding: 6px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-family: var(--mono);
+  font-size: 11px;
+}
+.add-line:hover { color: var(--accent); border-color: var(--accent); }
+
+/* Preview Markdown styling -- vendored mini renderer */
+.preview h1, .preview h2, .preview h3, .preview h4 {
+  margin: 1em 0 0.5em; line-height: 1.25; color: var(--text);
+}
+.preview h1 { font-size: 1.8em; border-bottom: 1px solid var(--border); padding-bottom: 0.3em; }
+.preview h2 { font-size: 1.4em; border-bottom: 1px solid var(--border); padding-bottom: 0.2em; }
+.preview h3 { font-size: 1.2em; }
+.preview h4 { font-size: 1.05em; }
+.preview p  { margin: 0.6em 0; }
+.preview ul, .preview ol { margin: 0.6em 0; padding-left: 1.8em; }
+.preview li { margin: 0.2em 0; }
+.preview code {
+  background: var(--bg-2); padding: 1px 5px; border-radius: 3px;
+  font-family: var(--mono); font-size: 0.92em;
+}
+.preview pre {
+  background: var(--bg-2); padding: 10px 14px; border-radius: 6px;
+  overflow-x: auto;
+}
+.preview pre code { background: transparent; padding: 0; }
+.preview blockquote {
+  border-left: 3px solid var(--accent); margin: 0.6em 0;
+  padding: 0 0 0 14px; color: var(--text-dim);
+}
+.preview a { color: var(--accent); }
+.preview hr { border: none; border-top: 1px solid var(--border); margin: 1.5em 0; }
+.preview strong { color: var(--text); }
+.preview em { color: var(--text); }
+.preview img { max-width: 100%; }
+.preview table {
+  border-collapse: collapse; margin: 0.6em 0;
+}
+.preview table th, .preview table td {
+  border: 1px solid var(--border); padding: 4px 10px;
+}
+.preview table th { background: var(--bg-2); }
+
+footer {
+  padding: 6px 16px; background: var(--bg-1);
+  border-top: 1px solid var(--border);
+  font-size: 11px; font-family: var(--mono); color: var(--text-dim);
+  display: flex; justify-content: space-between; flex-shrink: 0;
+}
+footer a { color: var(--accent); text-decoration: none; }
+footer a:hover { text-decoration: underline; }
+
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: var(--bg-0); }
+::-webkit-scrollbar-thumb { background: var(--bg-3); border-radius: 5px; }
+</style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <div class="title">Aether-Core <span class="badge">Markdown</span></div>
+    <button id="reset" title="Wipe local cache and reload">Reset</button>
+    <div class="spacer"></div>
+    <div id="peers" class="peers"></div>
+    <div id="status" class="status"><span class="dot"></span><span class="text">connecting…</span></div>
+  </header>
+  <main>
+    <section class="pane">
+      <div class="pane-head">Editor</div>
+      <div id="editor" class="editor"></div>
+    </section>
+    <section class="pane">
+      <div class="pane-head">Preview</div>
+      <div id="preview" class="preview"></div>
+    </section>
+  </main>
+  <footer>
+    <span id="counts">0 lines</span>
+    <span>Built on Aether-Core · <a href="../index.html">Topology</a> · <a href="kanban.html">Kanban</a></span>
+  </footer>
+</div>
+
+<script src="../aether.js"></script>
+<script>
+'use strict';
+
+/* -----------------------------------------------------------------
+ * State schema (CRDT keys)
+ * -----------------------------------------------------------------
+ *
+ *   doc:order            -> string[]   (array of line ids in display order)
+ *   line:<lineId>        -> { id, text }
+ *
+ * Storing the order as a single key trades fine-grained ordering CRDT
+ * complexity for LWW simplicity. Concurrent inserts at the same
+ * position resolve to the highest-HLC writer's order, which is
+ * occasionally surprising but always consistent. For a "killer demo"
+ * of the engine itself this is the right complexity trade.
+ *
+ * Storing each line as its own key isolates concurrent edits: two
+ * users typing in different paragraphs never conflict.
+ */
+
+const GATEWAY_URL = (location.protocol === 'https:' ? 'wss://' : 'ws://')
+                  + location.hostname + ':8211';
+
+const aether = new Aether(GATEWAY_URL, { cacheKey: 'aether::markdown::v1' });
+
+const $editor  = document.getElementById('editor');
+const $preview = document.getElementById('preview');
+const $status  = document.getElementById('status');
+const $counts  = document.getElementById('counts');
+const $peers   = document.getElementById('peers');
+const $reset   = document.getElementById('reset');
+
+const newId = () => 'L-' + (
+  crypto.randomUUID ? crypto.randomUUID().slice(0, 8)
+                    : Math.random().toString(36).slice(2, 10)
+);
+
+const SEED_DOC = [
+  '# Aether-Core',
+  '',
+  'A **collaborative Markdown editor** built on the Zero-Transit engine.',
+  '',
+  '- Open this page in two tabs to see real-time sync.',
+  '- Each paragraph is its own CRDT key, so concurrent edits in',
+  '  different lines never conflict.',
+  '- Stop the gateway and refresh — the document still renders from',
+  '  `localStorage`.',
+  '',
+  '## How it works',
+  '',
+  '```',
+  'doc:order      -> ["L-a1b2c3", "L-d4e5f6", ...]',
+  'line:L-a1b2c3  -> { id, text }',
+  '```',
+  '',
+  '> The Python server is a relay. Your frontend variables are the database.',
+];
+
+// ---- Reads --------------------------------------------------------
+
+function getOrder() {
+  const ord = aether.get('doc:order');
+  return Array.isArray(ord) ? ord : [];
+}
+
+function getLine(id) {
+  const v = aether.get('line:' + id);
+  return v && typeof v === 'object' ? v : null;
+}
+
+// ---- Writes -------------------------------------------------------
+
+function setOrder(order) {
+  aether.set('doc:order', order);
+}
+
+function setLine(id, text) {
+  aether.set('line:' + id, { id, text });
+}
+
+function deleteLine(id) {
+  const ord = getOrder().filter((x) => x !== id);
+  setOrder(ord);
+  aether.delete('line:' + id);
+}
+
+function insertLineAfter(afterId, text = '') {
+  const id = newId();
+  const ord = getOrder().slice();
+  const idx = ord.indexOf(afterId);
+  if (idx === -1) ord.push(id);
+  else ord.splice(idx + 1, 0, id);
+  setLine(id, text);
+  setOrder(ord);
+  return id;
+}
+
+function appendLine(text = '') {
+  const id = newId();
+  const ord = getOrder().slice();
+  ord.push(id);
+  setLine(id, text);
+  setOrder(ord);
+  return id;
+}
+
+// ---- Editor rendering --------------------------------------------
+
+/**
+ * Re-render the editor pane from the current CRDT state.
+ *
+ * We try hard NOT to clobber the input the user is currently typing
+ * in: we track the focused element's line id + cursor offset, then
+ * restore both after the rebuild. Without this, remote edits would
+ * blow away the local caret on every keystroke.
+ */
+function renderEditor() {
+  const focused = document.activeElement;
+  let restoreId   = null;
+  let restoreSel  = null;
+  if (focused && focused.classList && focused.classList.contains('input')) {
+    restoreId  = focused.dataset.lineId;
+    restoreSel = { start: focused.selectionStart, end: focused.selectionEnd };
+  }
+
+  $editor.innerHTML = '';
+  const ord = getOrder();
+  let n = 0;
+  for (const id of ord) {
+    const line = getLine(id);
+    if (!line) continue;
+    n++;
+    $editor.appendChild(renderLine(line, n));
+  }
+
+  // "Add line at end" button.
+  const addBtn = document.createElement('button');
+  addBtn.className = 'add-line';
+  addBtn.textContent = '+ add line';
+  addBtn.onclick = () => {
+    const id = appendLine('');
+    setTimeout(() => {
+      const inp = $editor.querySelector(`[data-line-id="${id}"]`);
+      if (inp) inp.focus();
+    }, 0);
+  };
+  $editor.appendChild(addBtn);
+
+  $counts.textContent = `${n} line${n === 1 ? '' : 's'}`;
+
+  // Restore focus + selection.
+  if (restoreId) {
+    const inp = $editor.querySelector(`[data-line-id="${restoreId}"]`);
+    if (inp) {
+      inp.focus();
+      if (restoreSel) {
+        try { inp.setSelectionRange(restoreSel.start, restoreSel.end); }
+        catch (_) {}
+      }
+    }
+  }
+}
+
+function renderLine(line, n) {
+  const wrap = document.createElement('div');
+  wrap.className = 'line';
+
+  const gutter = document.createElement('div');
+  gutter.className = 'gutter';
+  gutter.textContent = n;
+  wrap.appendChild(gutter);
+
+  const input = document.createElement('textarea');
+  input.className = 'input';
+  input.rows = 1;
+  input.value = line.text;
+  input.dataset.lineId = line.id;
+  input.placeholder = '(empty line)';
+
+  const autoSize = () => {
+    input.style.height = 'auto';
+    input.style.height = input.scrollHeight + 'px';
+  };
+  setTimeout(autoSize, 0);
+
+  let saveTimer = null;
+  input.oninput = () => {
+    autoSize();
+    // Debounced save -- ~80 ms keeps localStorage and the gateway
+    // happy during keystroke bursts.
+    if (saveTimer !== null) clearTimeout(saveTimer);
+    saveTimer = setTimeout(() => {
+      saveTimer = null;
+      const cur = getLine(line.id);
+      if (!cur || cur.text !== input.value) {
+        setLine(line.id, input.value);
+      }
+    }, 60);
+  };
+
+  input.onkeydown = (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      // Flush any pending edit so the new line lands AFTER the
+      // current state, not interleaved with it.
+      if (saveTimer !== null) {
+        clearTimeout(saveTimer); saveTimer = null;
+        setLine(line.id, input.value);
+      }
+      const newLineId = insertLineAfter(line.id, '');
+      setTimeout(() => {
+        const inp = $editor.querySelector(`[data-line-id="${newLineId}"]`);
+        if (inp) inp.focus();
+      }, 0);
+    } else if (e.key === 'Backspace' && input.value === '' && getOrder().length > 1) {
+      e.preventDefault();
+      const ord = getOrder();
+      const idx = ord.indexOf(line.id);
+      const prev = idx > 0 ? ord[idx - 1] : null;
+      deleteLine(line.id);
+      if (prev) {
+        setTimeout(() => {
+          const inp = $editor.querySelector(`[data-line-id="${prev}"]`);
+          if (inp) { inp.focus(); inp.setSelectionRange(inp.value.length, inp.value.length); }
+        }, 0);
+      }
+    }
+  };
+
+  // Flush on blur too, so the final value lands even if the user
+  // switches tabs mid-keystroke-debounce.
+  input.onblur = () => {
+    if (saveTimer !== null) {
+      clearTimeout(saveTimer); saveTimer = null;
+      const cur = getLine(line.id);
+      if (!cur || cur.text !== input.value) setLine(line.id, input.value);
+    }
+  };
+
+  const ctrls = document.createElement('div');
+  ctrls.className = 'ctrls';
+  const up = document.createElement('button');
+  up.textContent = '↑'; up.title = 'Move up';
+  up.onclick = () => moveLine(line.id, -1);
+  const dn = document.createElement('button');
+  dn.textContent = '↓'; dn.title = 'Move down';
+  dn.onclick = () => moveLine(line.id, +1);
+  const del = document.createElement('button');
+  del.textContent = '×'; del.title = 'Delete line';
+  del.onclick = () => deleteLine(line.id);
+  ctrls.append(up, dn, del);
+
+  wrap.append(input, ctrls);
+  return wrap;
+}
+
+function moveLine(id, delta) {
+  const ord = getOrder();
+  const idx = ord.indexOf(id);
+  const next = idx + delta;
+  if (idx === -1 || next < 0 || next >= ord.length) return;
+  const newOrder = ord.slice();
+  [newOrder[idx], newOrder[next]] = [newOrder[next], newOrder[idx]];
+  setOrder(newOrder);
+}
+
+// ---- Preview rendering -------------------------------------------
+
+/**
+ * Mini Markdown -> HTML renderer. Vendored and intentionally small.
+ * Supports: headings, paragraphs, fenced code, inline code, bold,
+ * italic, links, lists, blockquotes, horizontal rules, line breaks.
+ * Escapes HTML strictly to prevent XSS via collaborator input --
+ * a hostile peer must not be able to inject scripts via line text.
+ */
+function escapeHtml(s) {
+  return s.replace(/[&<>"']/g, (c) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;',
+    '"': '&quot;', "'": '&#39;',
+  }[c]));
+}
+
+function renderInline(s) {
+  s = escapeHtml(s);
+  // code spans first (so other rules don't see their contents)
+  s = s.replace(/`([^`]+)`/g, '<code>$1</code>');
+  // bold + italic
+  s = s.replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>');
+  s = s.replace(/(^|[^*])\*([^*\n]+)\*/g, '$1<em>$2</em>');
+  // links [text](url)
+  s = s.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_m, t, u) =>
+    `<a href="${u}" target="_blank" rel="noopener noreferrer">${t}</a>`);
+  return s;
+}
+
+function renderPreview() {
+  const ord = getOrder();
+  const lines = ord.map((id) => {
+    const l = getLine(id);
+    return l ? l.text : '';
+  });
+
+  // Block-level pass. We walk lines and emit HTML blocks.
+  const out = [];
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+
+    // Fenced code block
+    if (/^```/.test(line)) {
+      const codeLines = [];
+      i++;
+      while (i < lines.length && !/^```/.test(lines[i])) {
+        codeLines.push(lines[i]);
+        i++;
+      }
+      i++; // skip closing fence
+      out.push('<pre><code>' + escapeHtml(codeLines.join('\n')) + '</code></pre>');
+      continue;
+    }
+
+    // Headings
+    const h = /^(#{1,4})\s+(.*)$/.exec(line);
+    if (h) {
+      const level = h[1].length;
+      out.push(`<h${level}>${renderInline(h[2])}</h${level}>`);
+      i++;
+      continue;
+    }
+
+    // Horizontal rule
+    if (/^---+$/.test(line.trim())) {
+      out.push('<hr>');
+      i++;
+      continue;
+    }
+
+    // Blockquote (single-line)
+    const bq = /^>\s+(.*)$/.exec(line);
+    if (bq) {
+      out.push('<blockquote>' + renderInline(bq[1]) + '</blockquote>');
+      i++;
+      continue;
+    }
+
+    // Unordered list block
+    if (/^[-*]\s+/.test(line)) {
+      const items = [];
+      while (i < lines.length && /^[-*]\s+/.test(lines[i])) {
+        items.push('<li>' + renderInline(lines[i].replace(/^[-*]\s+/, '')) + '</li>');
+        i++;
+      }
+      out.push('<ul>' + items.join('') + '</ul>');
+      continue;
+    }
+
+    // Ordered list block
+    if (/^\d+\.\s+/.test(line)) {
+      const items = [];
+      while (i < lines.length && /^\d+\.\s+/.test(lines[i])) {
+        items.push('<li>' + renderInline(lines[i].replace(/^\d+\.\s+/, '')) + '</li>');
+        i++;
+      }
+      out.push('<ol>' + items.join('') + '</ol>');
+      continue;
+    }
+
+    // Blank line
+    if (line.trim() === '') {
+      i++;
+      continue;
+    }
+
+    // Paragraph (consume contiguous non-empty lines)
+    const para = [];
+    while (i < lines.length && lines[i].trim() !== ''
+           && !/^(#{1,4})\s/.test(lines[i])
+           && !/^```/.test(lines[i])
+           && !/^>\s/.test(lines[i])
+           && !/^[-*]\s/.test(lines[i])
+           && !/^\d+\.\s/.test(lines[i])) {
+      para.push(lines[i]);
+      i++;
+    }
+    out.push('<p>' + renderInline(para.join('\n').replace(/\n/g, '<br>')) + '</p>');
+  }
+
+  $preview.innerHTML = out.join('\n');
+}
+
+// ---- Wiring -------------------------------------------------------
+
+aether.onStatus((connected) => {
+  if (connected) {
+    $status.classList.add('connected');
+    $status.querySelector('.text').textContent =
+      'connected · ' + GATEWAY_URL.replace('ws://', '');
+  } else {
+    $status.classList.remove('connected');
+    $status.querySelector('.text').textContent = 'disconnected · retrying…';
+  }
+});
+
+aether.onAny((key) => {
+  if (key.startsWith('line:') || key === 'doc:order') {
+    renderEditor();
+    renderPreview();
+  }
+});
+
+// Presence indicators (other tabs as coloured dots).
+const peerColors = new Map();
+aether.onPresence((id, _x, _y, color) => {
+  peerColors.set(id, color);
+  renderPeers();
+});
+aether.onPresenceLeave((id) => {
+  peerColors.delete(id);
+  renderPeers();
+});
+function renderPeers() {
+  $peers.innerHTML = '';
+  const n = peerColors.size;
+  if (n === 0) return;
+  let count = 0;
+  for (const [, color] of peerColors) {
+    const d = document.createElement('span');
+    d.className = 'peer-dot';
+    d.style.background = color;
+    $peers.appendChild(d);
+    count++;
+    if (count >= 5) break;
+  }
+  const label = document.createElement('span');
+  label.textContent = ` ${n} other${n === 1 ? '' : 's'}`;
+  $peers.appendChild(label);
+}
+
+// Heartbeat presence pings so siblings know we're alive.
+let lastPresence = 0;
+setInterval(() => {
+  if (Date.now() - lastPresence > 3000) {
+    aether.sendPresence(0, 0);
+    lastPresence = Date.now();
+  }
+}, 3000);
+
+$reset.onclick = () => {
+  if (!confirm('This wipes your local cache and reloads the page.')) return;
+  aether.clearCache();
+  location.reload();
+};
+
+aether.ready().then(() => {
+  // Seed the document the first time.
+  if (getOrder().length === 0) {
+    const ord = [];
+    for (const text of SEED_DOC) {
+      const id = newId();
+      setLine(id, text);
+      ord.push(id);
+    }
+    setOrder(ord);
+  }
+  renderEditor();
+  renderPreview();
+});
+</script>
+</body>
+</html>

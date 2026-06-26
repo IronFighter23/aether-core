@@ -1,0 +1,102 @@
+{
+  "machine": {
+    "python": "3.12.3",
+    "platform": "Linux-6.18.5-x86_64-with-glibc2.39",
+    "processor": "x86_64",
+    "executable": "/usr/bin/python"
+  },
+  "ledger": {
+    "1000": {
+      "num_ops": 1000,
+      "unique_keys": 200,
+      "ledger_bytes": 117890,
+      "write_seconds": 0.7497,
+      "write_ops_per_sec": 1333.9,
+      "replay_seconds": 0.0117,
+      "replay_ops_per_sec": 85763.1,
+      "snapshot_boot_seconds": 0.0103,
+      "snapshot_speedup": 1.13,
+      "snapshot_entries": 200,
+      "snapshot_skipped_ops": 1000,
+      "compaction": {
+        "records_read": 1000,
+        "live_keys": 200,
+        "tombstones": 0,
+        "snapshot_bytes": 46140,
+        "compaction_ratio": 0.391
+      }
+    },
+    "10000": {
+      "num_ops": 10000,
+      "unique_keys": 2000,
+      "ledger_bytes": 1188890,
+      "write_seconds": 7.2342,
+      "write_ops_per_sec": 1382.3,
+      "replay_seconds": 0.1318,
+      "replay_ops_per_sec": 75856.8,
+      "snapshot_boot_seconds": 0.072,
+      "snapshot_speedup": 1.83,
+      "snapshot_entries": 2000,
+      "snapshot_skipped_ops": 10000,
+      "compaction": {
+        "records_read": 10000,
+        "live_keys": 2000,
+        "tombstones": 0,
+        "snapshot_bytes": 460343,
+        "compaction_ratio": 0.387
+      }
+    },
+    "50000": {
+      "num_ops": 50000,
+      "unique_keys": 10000,
+      "ledger_bytes": 5988890,
+      "write_seconds": 35.4084,
+      "write_ops_per_sec": 1412.1,
+      "replay_seconds": 0.5774,
+      "replay_ops_per_sec": 86589.9,
+      "snapshot_boot_seconds": 0.3686,
+      "snapshot_speedup": 1.57,
+      "snapshot_entries": 10000,
+      "snapshot_skipped_ops": 50000,
+      "compaction": {
+        "records_read": 50000,
+        "live_keys": 10000,
+        "tombstones": 0,
+        "snapshot_bytes": 2310344,
+        "compaction_ratio": 0.386
+      }
+    }
+  },
+  "gateway_roundtrip": {
+    "samples": 500,
+    "p50_ms": 0.21,
+    "p95_ms": 0.568,
+    "p99_ms": 0.683,
+    "max_ms": 1.041,
+    "mean_ms": 0.263,
+    "stdev_ms": 0.122
+  },
+  "mesh_convergence": [
+    {
+      "num_nodes": 3,
+      "num_writes": 100,
+      "topology": "ring",
+      "convergence_s": 0.0465,
+      "writes_per_sec": 2152.2
+    },
+    {
+      "num_nodes": 5,
+      "num_writes": 100,
+      "topology": "ring",
+      "convergence_s": 0.063,
+      "writes_per_sec": 1587.3
+    },
+    {
+      "num_nodes": 10,
+      "num_writes": 50,
+      "topology": "ring",
+      "convergence_s": 0.0539,
+      "writes_per_sec": 928.3
+    }
+  ]
+}
