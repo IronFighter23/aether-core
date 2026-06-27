@@ -23,9 +23,10 @@ therefore guaranteed for any delivery order of operations.
 from __future__ import annotations
 
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Generic, Iterator, Optional, TypeVar
+from typing import Generic, Iterable, Iterator, Optional, TypeVar
 
 __all__ = [
     "HybridLogicalClock",
@@ -328,15 +329,41 @@ class Node(Generic[K, V]):
     In the full architecture this object is what the Holographic Plane
     will wrap with a WebSocket transport. For now it exposes a synchronous
     in-process API so we can prove the math without networking noise.
+
+    Memory bound
+    ------------
+    The ``oplog`` ring buffer is bounded by ``max_oplog_size`` (default
+    10_000 entries). Older operations are evicted FIFO once the cap is
+    reached. **Durability of the full operation history lives in the
+    ChronoLedger, not here** -- the in-memory oplog is for diagnostics
+    and small-scale demos. Pass ``max_oplog_size=None`` to disable the
+    cap (only safe for short-lived test runs; otherwise the process
+    leaks memory in proportion to total operation count, which is the
+    exact bug this parameter fixes).
     """
 
-    __slots__ = ("_id", "_clock", "_store", "_oplog")
+    __slots__ = ("_id", "_clock", "_store", "_oplog", "_oplog_unbounded")
 
-    def __init__(self, node_id: NodeId) -> None:
+    def __init__(
+        self,
+        node_id: NodeId,
+        *,
+        max_oplog_size: Optional[int] = 10_000,
+    ) -> None:
         self._id = node_id
         self._clock = HLCGenerator(node_id)
         self._store: LWWMap[K, V] = LWWMap()
-        self._oplog: list[Operation[K, V]] = []
+        # When bounded, use a deque with maxlen so .append() is O(1) and
+        # the oldest entry is evicted automatically once we cross the cap.
+        # When unbounded, fall back to a list (legacy behaviour) for
+        # callers who relied on indexing semantics.
+        self._oplog_unbounded: bool = max_oplog_size is None
+        if max_oplog_size is None:
+            self._oplog: Iterable[Operation[K, V]] = []
+        else:
+            if max_oplog_size <= 0:
+                raise ValueError("max_oplog_size must be positive or None")
+            self._oplog = deque(maxlen=int(max_oplog_size))
 
     @property
     def id(self) -> NodeId:
@@ -347,18 +374,20 @@ class Node(Generic[K, V]):
         return self._store
 
     @property
-    def oplog(self) -> list[Operation[K, V]]:
+    def oplog(self) -> Iterable[Operation[K, V]]:
         # Exposed for the future Chrono-Vector Storage layer to consume.
+        # Returned as the live container so iteration is O(n) and indexing
+        # works if and only if the oplog is unbounded (i.e. backed by list).
         return self._oplog
 
     def set(self, key: K, value: V) -> Operation[K, V]:
         op = self._store.set(key, value, self._clock.tick())
-        self._oplog.append(op)
+        self._oplog.append(op)  # type: ignore[union-attr]
         return op
 
     def delete(self, key: K) -> Operation[K, V]:
         op = self._store.delete(key, self._clock.tick())
-        self._oplog.append(op)
+        self._oplog.append(op)  # type: ignore[union-attr]
         return op
 
     def get(self, key: K) -> Optional[V]:
@@ -368,7 +397,7 @@ class Node(Generic[K, V]):
         """Receive a remote operation. Advances local HLC past sender's stamp."""
         self._clock.observe(op.stamp)
         self._store.apply(op)
-        self._oplog.append(op)
+        self._oplog.append(op)  # type: ignore[union-attr]
 
     def merge_from(self, other: "Node[K, V]") -> None:
         """State-based merge: pull all of ``other``'s state into self."""

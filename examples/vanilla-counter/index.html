@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<!--
+    Aether-Core :: vanilla counter (the "no backend code" demo)
+    ===========================================================
+    This single HTML file is the whole frontend. Open it in two browser
+    tabs while the Python relay is running and watch them sync in
+    real time. There is no app server. There are no API routes. There
+    is no schema. The CRDT relay does it all.
+
+    Tip: drop "ws://localhost:8211" into the URL bar of the script and
+    point it at your own gateway. The protocol is the same on any host.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Aether-Core :: vanilla counter</title>
+  <style>
+    body { font: 16px/1.5 system-ui, sans-serif; max-width: 480px;
+           margin: 4rem auto; padding: 0 1rem; color: #222; }
+    button { font: inherit; padding: 0.6rem 1rem; cursor: pointer;
+             border: 1px solid #444; border-radius: 6px; background: #fff; }
+    button:hover { background: #f3f3f3; }
+    #count  { font: 700 3rem/1 ui-monospace, monospace; margin: 1rem 0; }
+    #status { font: 0.85rem/1 ui-monospace, monospace; color: #888; }
+    .ok     { color: #1f7a1f; }
+    .off    { color: #b91c1c; }
+  </style>
+</head>
+<body>
+  <h1>Aether counter</h1>
+  <p>Open this file in <b>two</b> browser tabs. Click the button. They sync.</p>
+
+  <div id="count">…</div>
+  <button id="bump">+1</button>
+  <button id="reset">reset</button>
+  <p id="status">connecting…</p>
+
+  <!-- The client is one ~750-line file. No build step, no bundler.       -->
+  <script src="../../web/aether.js"></script>
+  <script>
+    // 1. Connect to the relay (you started this with `aether-demo`).
+    const aether = new Aether('ws://localhost:8211');
+
+    // 2. Render whatever the relay says the current value is.
+    const $count  = document.getElementById('count');
+    const $status = document.getElementById('status');
+    const render = (n) => { $count.textContent = (n ?? 0); };
+
+    aether.ready().then(() => render(aether.get('count')));
+    aether.on('count', render);
+
+    // 3. Buttons mutate the shared variable. The relay echoes the
+    //    change to every other connected tab.
+    document.getElementById('bump').onclick = () => {
+      aether.set('count', (aether.get('count') ?? 0) + 1);
+    };
+    document.getElementById('reset').onclick = () => {
+      aether.set('count', 0);
+    };
+
+    // 4. Connection indicator. Pure UX -- not part of the sync logic.
+    aether.onStatus((connected) => {
+      $status.textContent = connected ? 'connected ✓' : 'offline (cached)';
+      $status.className   = connected ? 'ok' : 'off';
+    });
+  </script>
+</body>
+</html>

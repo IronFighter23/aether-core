@@ -46,16 +46,20 @@ import abc
 import asyncio
 import json
 import logging
+import ssl
 from typing import Any, Awaitable, Callable, Optional
 
 from websockets import connect, serve
 from websockets.exceptions import ConnectionClosed
 
 from aether_core._security import (
+    AuthConfig,
+    AuthError,
     ConnectionCounter,
     ConnectionLimitError,
     PayloadTooLargeError,
     SecurityLimits,
+    SeenStampCache,
     TokenBucket,
     validate_payload,
     with_handshake_timeout,
@@ -222,7 +226,7 @@ class WebSocketMeshPubSub(MeshPubSub):
 
     __slots__ = (
         "_node_id", "_host", "_port",
-        "_limits",
+        "_limits", "_auth", "_ssl",
         "_connections", "_buckets", "_conn_counter",
         "_server", "_tasks", "_lock", "_closed",
     )
@@ -234,12 +238,16 @@ class WebSocketMeshPubSub(MeshPubSub):
         port: int = 0,
         *,
         limits: Optional[SecurityLimits] = None,
+        auth: Optional[AuthConfig] = None,
+        ssl_context: Optional[ssl.SSLContext] = None,
     ) -> None:
         super().__init__()
         self._node_id = node_id
         self._host = host
         self._port = port
         self._limits = limits or SecurityLimits()
+        self._auth = auth or AuthConfig()
+        self._ssl = ssl_context
         # peer_id -> live WebSocket
         self._connections: dict[str, Any] = {}
         # peer_id -> TokenBucket  (peers get their own rate budget)
@@ -276,6 +284,7 @@ class WebSocketMeshPubSub(MeshPubSub):
             self._host,
             self._port,
             max_size=self._limits.max_frame_bytes,
+            ssl=self._ssl,
         )
         # Resolve ephemeral ports if the caller asked for one.
         if self._port == 0:
@@ -283,12 +292,16 @@ class WebSocketMeshPubSub(MeshPubSub):
                 self._port = sock.getsockname()[1]
                 break
         logger.info(
-            "[%s] mesh-pubsub listening on ws://%s:%d "
-            "(rate=%.0f msg/s, max_peers=%d, frame_cap=%d B)",
-            self._node_id, self._host, self._port,
+            "[%s] mesh-pubsub listening on %s://%s:%d "
+            "(rate=%.0f msg/s, max_peers=%d, frame_cap=%d B, auth=%s, tls=%s)",
+            self._node_id,
+            "wss" if self._ssl else "ws",
+            self._host, self._port,
             self._limits.messages_per_second,
             self._limits.max_connections_total,
             self._limits.max_frame_bytes,
+            "required" if self._auth.required else "off",
+            "on" if self._ssl else "off",
         )
 
     async def stop(self) -> None:
@@ -326,10 +339,18 @@ class WebSocketMeshPubSub(MeshPubSub):
     async def connect_to(self, host: str, port: int) -> str:
         if self._closed:
             raise RuntimeError("driver stopped")
-        uri = f"ws://{host}:{port}"
-        ws = await connect(uri, max_size=self._limits.max_frame_bytes)
+        scheme = "wss" if self._ssl else "ws"
+        uri = f"{scheme}://{host}:{port}"
+        ws = await connect(uri, max_size=self._limits.max_frame_bytes, ssl=self._ssl)
         try:
-            await ws.send(json.dumps({"type": "hello", "node_id": self._node_id}))
+            # Outbound hello carries our identity AND (if configured) our
+            # shared-secret token. The remote peer will verify the token
+            # against its own ``AuthConfig`` before promoting the channel
+            # to a federated peer slot.
+            hello: dict[str, Any] = {"type": "hello", "node_id": self._node_id}
+            if self._auth.required:
+                hello["auth_token"] = self._auth.token
+            await ws.send(json.dumps(hello))
             # Slow-loris guard: peer must hello back within handshake_timeout_s.
             raw = await with_handshake_timeout(
                 ws.recv(), limits=self._limits, what=f"outbound hello to {uri}",
@@ -339,6 +360,12 @@ class WebSocketMeshPubSub(MeshPubSub):
                 await ws.close()
                 raise RuntimeError(f"bad handshake from {uri}: {msg!r}")
             peer_id = str(msg["node_id"])
+            # If WE require auth, the peer's hello must also present our
+            # token (mutual auth). When ``required`` is False this branch
+            # is skipped and the legacy open-mesh behaviour is preserved.
+            if self._auth.required and not self._auth.verify(msg.get("auth_token")):
+                await ws.close(code=1008, reason="auth failed")
+                raise AuthError(f"peer {peer_id} from {uri} failed mutual auth")
         except Exception:
             try:
                 await ws.close()
@@ -403,7 +430,26 @@ class WebSocketMeshPubSub(MeshPubSub):
                 self._conn_counter.release(source)
                 return
             peer_id = str(msg["node_id"])
-            await ws.send(json.dumps({"type": "hello", "node_id": self._node_id}))
+
+            # Authenticate the inbound peer BEFORE we register them
+            # against our connections map. A peer that fails auth is
+            # closed before they can publish or observe a single op.
+            if self._auth.required and not self._auth.verify(msg.get("auth_token")):
+                logger.warning(
+                    "[%s] refused peer %s (from %s): auth token mismatch",
+                    self._node_id, peer_id, source,
+                )
+                try:
+                    await ws.close(code=1008, reason="auth failed")
+                except Exception:  # noqa: BLE001
+                    pass
+                self._conn_counter.release(source)
+                return
+
+            reply: dict[str, Any] = {"type": "hello", "node_id": self._node_id}
+            if self._auth.required:
+                reply["auth_token"] = self._auth.token
+            await ws.send(json.dumps(reply))
 
             if not await self._register_connection(peer_id, ws, direction="in"):
                 await ws.close()
@@ -598,15 +644,36 @@ class MeshNode:
         on_op: Optional[Callable[[Operation[Any, Any], Optional[str]], Awaitable[None]]] = None,
         pubsub: Optional[MeshPubSub] = None,
         limits: Optional[SecurityLimits] = None,
+        auth: Optional[AuthConfig] = None,
+        ssl_context: Optional[ssl.SSLContext] = None,
     ) -> None:
-        self.node: Node[str, Any] = Node(node_id)
-        # Default driver: WebSocket gossip on (host, port).
+        effective_limits = limits or SecurityLimits()
+        self.node: Node[str, Any] = Node(
+            node_id,
+            max_oplog_size=effective_limits.max_oplog_size,
+        )
+        # Default driver: WebSocket gossip on (host, port). When the caller
+        # supplies a custom pubsub, they own its auth/ssl wiring; we don't
+        # second-guess them.
         self._pubsub: MeshPubSub = (
             pubsub if pubsub is not None
-            else WebSocketMeshPubSub(node_id, host, port, limits=limits)
+            else WebSocketMeshPubSub(
+                node_id, host, port,
+                limits=effective_limits,
+                auth=auth,
+                ssl_context=ssl_context,
+            )
         )
         self._pubsub.set_on_remote_op(self._ingest_remote)
-        self._seen: set[HybridLogicalClock] = set()
+        # Bounded HLC dedup cache. The cap protects long-running federations
+        # from unbounded memory growth: a node that never recycles a stamp
+        # set will eventually OOM in proportion to total ops federated.
+        # FIFO eviction is safe here because the CRDT apply path is
+        # idempotent -- the worst case for an evicted-then-reseen stamp
+        # is one extra rebroadcast, not a correctness violation.
+        self._seen: SeenStampCache = SeenStampCache(
+            max_size=effective_limits.max_seen_stamps,
+        )
         self._on_op = on_op
 
     # -- introspection ------------------------------------------------------

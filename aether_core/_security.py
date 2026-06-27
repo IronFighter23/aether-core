@@ -35,19 +35,24 @@ editing this file.
 from __future__ import annotations
 
 import asyncio
+import hmac
 import logging
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 __all__ = [
     "SecurityLimits",
+    "AuthConfig",
+    "AuthError",
     "PayloadTooLargeError",
     "RateLimitError",
     "ConnectionLimitError",
     "TokenBucket",
     "ConnectionCounter",
+    "SeenStampCache",
+    "secure_compare",
     "validate_payload",
 ]
 
@@ -68,6 +73,10 @@ class RateLimitError(ValueError):
 
 class ConnectionLimitError(ValueError):
     """Raised when accepting a new connection would breach a cap."""
+
+
+class AuthError(ValueError):
+    """Raised when a peer or client fails authentication."""
 
 
 # ---------------------------------------------------------------------------
@@ -117,6 +126,20 @@ class SecurityLimits:
     # A new connection has this many seconds to send its first message.
     # If it stays silent past the deadline, we close it.
     handshake_timeout_s: float = 5.0
+
+    # ---- Memory caps ------------------------------------------------------
+    # Maximum number of HLC stamps retained in the dedup cache. Older
+    # stamps are evicted FIFO. Stamps are ~80 bytes each (dataclass +
+    # interned strings), so 100k entries is ~8 MiB. Tune up for
+    # high-throughput federation, down for tiny embedded deployments.
+    max_seen_stamps: int = 100_000
+
+    # Maximum number of operations retained in the in-memory Node.oplog
+    # ring buffer. The oplog is used for diagnostics and for the in-process
+    # demo; durability lives in the ChronoLedger, not here. Old entries
+    # are evicted FIFO once the cap is reached. Set to None to make the
+    # oplog unbounded (only safe for short-lived test runs).
+    max_oplog_size: Optional[int] = 10_000
 
 
 # ---------------------------------------------------------------------------
@@ -217,6 +240,157 @@ class ConnectionCounter:
 
     def for_source(self, source: str) -> int:
         return self._per_source.get(source, 0)
+
+
+# ---------------------------------------------------------------------------
+# AuthConfig :: shared-secret token authentication
+# ---------------------------------------------------------------------------
+
+def secure_compare(a: Optional[str], b: Optional[str]) -> bool:
+    """
+    Constant-time string comparison. ``None`` never compares equal to
+    anything (including another ``None``) -- this matches the semantics
+    we want for "is this peer's token a configured value": missing
+    credentials never authenticate.
+    """
+    if a is None or b is None:
+        return False
+    # hmac.compare_digest works on equal-length byte strings; pad to the
+    # max of the two so we still leak no length signal beyond what's
+    # already public.
+    ab = a.encode("utf-8")
+    bb = b.encode("utf-8")
+    if len(ab) != len(bb):
+        # compare_digest already runs in constant time across unequal
+        # lengths since CPython 3.3, so this is safe.
+        return False
+    return hmac.compare_digest(ab, bb)
+
+
+@dataclass(frozen=True)
+class AuthConfig:
+    """
+    Shared-secret token authentication.
+
+    When ``token`` is ``None`` (the default), every connection is
+    accepted. When ``token`` is a string, every incoming connection
+    -- whether a browser client to the gateway, or a federated peer
+    to the mesh pubsub -- must present a matching token or it will
+    be closed before any state is exposed.
+
+    The token is a single arbitrary opaque string; the transport-layer
+    rules for how it is delivered live in each driver:
+
+    * **Mesh pubsub** (peer-to-peer): the token is included in the
+      ``hello`` JSON message exchanged on connect. A peer that does
+      not present a matching token has its socket closed before any
+      operation is read or replayed.
+
+    * **Client gateway** (browser-to-server): the token can be
+      delivered as a query parameter on the WebSocket URL
+      (``ws://host:port/?auth_token=...``) OR as the FIRST inbound
+      message after connect (``{"type": "auth", "token": "..."}``).
+      Connections that do neither within ``handshake_timeout_s`` are
+      closed.
+
+    Tokens are compared in constant time via ``hmac.compare_digest``
+    so a length-extension or timing oracle cannot recover the secret
+    byte-by-byte.
+
+    For a defense-in-depth deployment, pair this with TLS (the
+    ``ssl_context`` parameter on the gateway and mesh) so the token
+    is never sent in cleartext over the network.
+    """
+
+    token: Optional[str] = None
+
+    @property
+    def required(self) -> bool:
+        """
+        True when authentication is enforced (a non-empty token is
+        configured). Empty string is treated as "no token" so that a
+        misconfigured environment variable (``AETHER_TOKEN=``) does not
+        silently produce a gateway that authenticates only the empty
+        string -- a footgun we explicitly do not want.
+        """
+        return bool(self.token)
+
+    def verify(self, presented: Optional[str]) -> bool:
+        """Constant-time check; ``False`` when no token is configured (closed-by-default)."""
+        if not self.required:
+            # Calling code should check ``required`` first; if you got
+            # here without a token configured, you're checking a credential
+            # that nobody asked for. Refuse.
+            return False
+        return secure_compare(self.token, presented)
+
+
+# ---------------------------------------------------------------------------
+# SeenStampCache :: bounded HLC dedup with FIFO eviction
+# ---------------------------------------------------------------------------
+
+class SeenStampCache:
+    """
+    Bounded set of HLC stamps for gossip deduplication.
+
+    Operations are O(1):
+
+    * ``add(stamp)`` -- insert; if already present, no-op. When the
+      cache reaches ``max_size``, the oldest stamp is evicted.
+    * ``stamp in cache`` -- membership check.
+    * ``len(cache)`` -- current size.
+
+    Eviction policy is FIFO (oldest inserted first out). LRU was
+    considered but rejected: gossip propagation is bounded by the
+    network diameter, so a stamp that has not been seen in the last
+    N entries will not be re-broadcast through this node. A stamp
+    seen on the wire BEFORE it was inserted here would still be
+    evicted, but the consequence is at most one duplicate apply --
+    which is fine, because CRDT apply is idempotent by construction.
+
+    Backwards-compatible with the prior plain-``set`` implementation:
+    supports ``.add(stamp)`` and ``stamp in cache``.
+    """
+
+    __slots__ = ("_max", "_set", "_fifo")
+
+    def __init__(self, max_size: int = 100_000) -> None:
+        if max_size <= 0:
+            raise ValueError("max_size must be positive")
+        self._max: int = int(max_size)
+        # Two structures kept in lock-step: the set for O(1) lookup,
+        # the deque for FIFO eviction order.
+        self._set: set[Any] = set()
+        self._fifo: deque[Any] = deque()
+
+    def add(self, stamp: Any) -> bool:
+        """Insert ``stamp``. Returns True if newly inserted, False if duplicate."""
+        if stamp in self._set:
+            return False
+        if len(self._fifo) >= self._max:
+            old = self._fifo.popleft()
+            self._set.discard(old)
+        self._fifo.append(stamp)
+        self._set.add(stamp)
+        return True
+
+    def __contains__(self, stamp: object) -> bool:
+        return stamp in self._set
+
+    def __len__(self) -> int:
+        return len(self._set)
+
+    def __iter__(self) -> Iterable[Any]:
+        # FIFO order, oldest first. Useful for tests and metrics.
+        return iter(list(self._fifo))
+
+    def clear(self) -> None:
+        self._set.clear()
+        self._fifo.clear()
+
+    @property
+    def capacity(self) -> int:
+        return self._max
 
 
 # ---------------------------------------------------------------------------

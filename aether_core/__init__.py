@@ -1,9 +1,16 @@
 """Aether-Core: Zero-Transit Architecture primitives."""
 
 __author__  = "Nishant Bhatte"
-__version__ = "0.2.0"
+__version__ = "0.4.0"
 __license__ = "MIT"
 
+from aether_core._security import (
+    AuthConfig,
+    AuthError,
+    SecurityLimits,
+    SeenStampCache,
+    secure_compare,
+)
 from aether_core.crdt import (
     HybridLogicalClock,
     HLCGenerator,
@@ -27,6 +34,11 @@ from aether_core.gateway import ClientGateway, compose_hooks
 from aether_core.compact import compact, load_snapshot, snapshot_path_for
 
 __all__ = [
+    "AuthConfig",
+    "AuthError",
+    "SecurityLimits",
+    "SeenStampCache",
+    "secure_compare",
     "HybridLogicalClock",
     "HLCGenerator",
     "LWWRegister",

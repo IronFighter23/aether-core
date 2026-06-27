@@ -1,0 +1,79 @@
+{
+  "name": "@ironfighter23/aether-core",
+  "version": "0.4.0",
+  "description": "Zero-Transit sync engine — your frontend variables are the database. CRDT-backed, offline-first, real-time. With optional React bindings.",
+  "type": "module",
+  "main": "./index.cjs",
+  "module": "./index.mjs",
+  "types": "./index.d.ts",
+  "browser": "./index.mjs",
+  "exports": {
+    ".": {
+      "types":  "./index.d.ts",
+      "import": "./index.mjs",
+      "require": "./index.cjs",
+      "browser": "./index.mjs",
+      "default": "./index.mjs"
+    },
+    "./react": {
+      "types":  "./react.d.ts",
+      "import": "./react.mjs",
+      "default": "./react.mjs"
+    }
+  },
+  "files": [
+    "index.mjs",
+    "index.cjs",
+    "index.d.ts",
+    "react.mjs",
+    "react.d.ts",
+    "aether.cjs",
+    "aether-react.mjs",
+    "aether.d.ts",
+    "aether-react.d.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "crdt",
+    "real-time",
+    "collaborative",
+    "websocket",
+    "sync",
+    "offline-first",
+    "distributed-systems",
+    "react",
+    "react-hook",
+    "useaether",
+    "zero-transit",
+    "lww",
+    "hlc",
+    "hybrid-logical-clock"
+  ],
+  "author": "Nishant Bhatte (https://github.com/IronFighter23)",
+  "license": "MIT",
+  "homepage": "https://github.com/IronFighter23/aether-core#readme",
+  "bugs": {
+    "url": "https://github.com/IronFighter23/aether-core/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/IronFighter23/aether-core.git",
+    "directory": "npm"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "peerDependencies": {
+    "react": ">=16.8.0"
+  },
+  "peerDependenciesMeta": {
+    "react": {
+      "optional": true
+    }
+  },
+  "sideEffects": false,
+  "publishConfig": {
+    "access": "public"
+  }
+}

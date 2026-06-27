@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "aether-core"
-version = "0.3.0"
+version = "0.4.0"
 description = "Zero-Transit sync engine — your frontend variables are the database"
 readme = "README.md"
 license = { text = "MIT" }

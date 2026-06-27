@@ -1,0 +1,8 @@
+# Already covered by "files" in package.json, but explicit is good.
+node_modules/
+*.log
+.DS_Store
+.git/
+.github/
+__tests__/
+*.test.js

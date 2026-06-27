@@ -46,13 +46,16 @@ import asyncio
 import hashlib
 import json
 import logging
+import ssl
 import uuid
 from typing import Any, Awaitable, Callable, Optional
+from urllib.parse import parse_qs, urlparse
 
 from websockets import serve
 from websockets.exceptions import ConnectionClosed
 
 from aether_core._security import (
+    AuthConfig,
     ConnectionCounter,
     ConnectionLimitError,
     PayloadTooLargeError,
@@ -110,6 +113,37 @@ def _remote_addr(ws: Any) -> str:
     return "?"
 
 
+def _extract_query_token(ws: Any) -> Optional[str]:
+    """
+    Best-effort: pull ``?auth_token=...`` out of the upgrade request URL.
+
+    Browsers cannot set custom WebSocket headers, so the auth token is
+    most conveniently delivered as a query parameter on the WS URL.
+    Server-side, the request path is available on the websockets
+    connection object under different attribute names depending on the
+    library version (``request.path`` on >=12, ``path`` on older).
+    Probe both and return ``None`` if neither is present so the caller
+    can fall back to the first-message auth path.
+    """
+    path: Optional[str] = None
+    req = getattr(ws, "request", None)
+    if req is not None:
+        path = getattr(req, "path", None)
+    if path is None:
+        path = getattr(ws, "path", None)
+    if not isinstance(path, str) or "?" not in path:
+        return None
+    try:
+        parsed = urlparse(path if path.startswith(("/", "ws")) else "/" + path)
+        qs = parse_qs(parsed.query)
+    except Exception:  # noqa: BLE001
+        return None
+    vals = qs.get("auth_token")
+    if not vals:
+        return None
+    return vals[0]
+
+
 class ClientGateway:
     """
     Hardened WebSocket endpoint for browser clients.
@@ -129,7 +163,7 @@ class ClientGateway:
 
     __slots__ = (
         "_mesh", "_host", "_port",
-        "_limits",
+        "_limits", "_auth", "_ssl",
         "_clients",
         "_client_index",         # ws -> {"id": str, "color": str, "source": str}
         "_buckets",              # ws -> TokenBucket
@@ -144,11 +178,15 @@ class ClientGateway:
         port: int = 0,
         *,
         limits: Optional[SecurityLimits] = None,
+        auth: Optional[AuthConfig] = None,
+        ssl_context: Optional[ssl.SSLContext] = None,
     ) -> None:
         self._mesh = mesh_node
         self._host = host
         self._port = port
         self._limits = limits or SecurityLimits()
+        self._auth = auth or AuthConfig()
+        self._ssl = ssl_context
         self._clients: set[Any] = set()
         self._client_index: dict[Any, dict[str, str]] = {}
         self._buckets: dict[Any, TokenBucket] = {}
@@ -164,11 +202,15 @@ class ClientGateway:
     @property
     def port(self) -> int:        return self._port
     @property
-    def url(self) -> str:         return f"ws://{self._host}:{self._port}"
+    def url(self) -> str:
+        scheme = "wss" if self._ssl else "ws"
+        return f"{scheme}://{self._host}:{self._port}"
     @property
     def client_count(self) -> int: return len(self._clients)
     @property
     def limits(self) -> SecurityLimits: return self._limits
+    @property
+    def auth(self) -> AuthConfig:  return self._auth
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -184,6 +226,7 @@ class ClientGateway:
             # Tell websockets to reject oversize frames at the protocol
             # level, before any bytes hit Python heap allocations.
             max_size=self._limits.max_frame_bytes,
+            ssl=self._ssl,
         )
         if self._port == 0:
             for sock in self._server.sockets:
@@ -191,11 +234,13 @@ class ClientGateway:
                 break
         logger.info(
             "[gateway] browser endpoint live on %s "
-            "(rate=%.0f msg/s, max_conn=%d, frame_cap=%d B)",
+            "(rate=%.0f msg/s, max_conn=%d, frame_cap=%d B, auth=%s, tls=%s)",
             self.url,
             self._limits.messages_per_second,
             self._limits.max_connections_total,
             self._limits.max_frame_bytes,
+            "required" if self._auth.required else "off",
+            "on" if self._ssl else "off",
         )
 
     async def stop(self) -> None:
@@ -265,6 +310,69 @@ class ClientGateway:
             capacity=self._limits.messages_burst,
             refill_per_second=self._limits.messages_per_second,
         )
+
+        # 2. AUTHENTICATE (if required) BEFORE the connection is registered
+        #    against _clients and BEFORE the snapshot is sent. A client
+        #    that fails auth must never see the state. Two delivery modes
+        #    are accepted (browsers cannot set custom WS headers, so we
+        #    take the token via URL or first-message):
+        #      a) ?auth_token=... query param on the WebSocket URL
+        #      b) {"type": "auth", "token": "..."} as the first frame
+        #    Mode (a) is faster -- we never enter the client into the
+        #    registry, never spend a snapshot serialization on a rejected
+        #    peer. Mode (b) is the safety net for clients whose URL
+        #    happened to drop the query string.
+        if self._auth.required:
+            url_token = _extract_query_token(ws)
+            if url_token is not None:
+                if not self._auth.verify(url_token):
+                    logger.warning(
+                        "[gateway] refused %s: bad auth_token in URL",
+                        source,
+                    )
+                    try:
+                        await ws.close(code=1008, reason="auth failed")
+                    except Exception:  # noqa: BLE001
+                        pass
+                    self._conn_counter.release(source)
+                    return
+            else:
+                # Wait for the first-message auth frame. Slow-loris guard
+                # ensures we cannot be parked here indefinitely.
+                try:
+                    auth_raw = await with_handshake_timeout(
+                        ws.recv(), limits=self._limits, what="client auth",
+                    )
+                except asyncio.TimeoutError:
+                    self._conn_counter.release(source)
+                    return
+                try:
+                    text = validate_payload(auth_raw, self._limits)
+                    auth_msg = json.loads(text)
+                except (PayloadTooLargeError, ValueError, json.JSONDecodeError):
+                    try:
+                        await ws.close(code=1008, reason="auth failed")
+                    except Exception:  # noqa: BLE001
+                        pass
+                    self._conn_counter.release(source)
+                    return
+                if (
+                    not isinstance(auth_msg, dict)
+                    or auth_msg.get("type") != "auth"
+                    or not self._auth.verify(auth_msg.get("token"))
+                ):
+                    logger.warning(
+                        "[gateway] refused %s: auth handshake failed",
+                        source,
+                    )
+                    try:
+                        await ws.close(code=1008, reason="auth failed")
+                    except Exception:  # noqa: BLE001
+                        pass
+                    self._conn_counter.release(source)
+                    return
+
+        # 3. Register the (now authenticated) client.
         async with self._lock:
             self._clients.add(ws)
             self._client_index[ws] = {"id": client_id, "color": color, "source": source}
@@ -276,7 +384,7 @@ class ClientGateway:
         )
 
         try:
-            # 2. Send hello + snapshot.
+            # 4. Send hello + snapshot.
             await ws.send(json.dumps({
                 "type": "hello", "id": client_id, "color": color,
             }, separators=(",", ":")))
@@ -285,7 +393,7 @@ class ClientGateway:
                 separators=(",", ":"),
             ))
 
-            # 3. Slow-loris guard: the FIRST inbound message must arrive
+            # 5. Slow-loris guard: the FIRST inbound message must arrive
             #    within handshake_timeout_s, or we close the socket.
             try:
                 first_raw = await with_handshake_timeout(
@@ -295,7 +403,7 @@ class ClientGateway:
                 return
             await self._handle_client_message(first_raw, ws)
 
-            # 4. Steady-state message loop with rate limiting.
+            # 6. Steady-state message loop with rate limiting.
             async for raw in ws:
                 if not bucket.try_consume():
                     logger.warning(
@@ -351,6 +459,13 @@ class ClientGateway:
         # 3. Presence (cursor) -- relay only, never persisted.
         if mtype == "presence":
             await self._relay_presence(sender_ws, msg)
+            return
+
+        # 3b. Duplicate auth frames after a successful handshake are
+        #     ignored. (Clients that talk to both an auth-required and
+        #     an auth-disabled gateway may send the same first frame
+        #     in either order; we accept the redundancy silently.)
+        if mtype == "auth":
             return
 
         # 4. Durable mutations -- validate key and value, then push
