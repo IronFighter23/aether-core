@@ -28,3 +28,4 @@ Thumbs.db
 # Benchmark artifacts
 # (results.json IS committed deliberately so anyone browsing the repo
 #  sees real numbers; only delete it locally before re-benchmarking)
+npm/*.tgz
