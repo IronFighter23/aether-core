@@ -1,5 +1,5 @@
 {
-  "name": "@ironfighter23/aether-core",
+  "name": "@nishantbhatte/aether-core",
   "version": "0.4.0",
   "description": "Zero-Transit sync engine — your frontend variables are the database. CRDT-backed, offline-first, real-time. With optional React bindings.",
   "type": "module",

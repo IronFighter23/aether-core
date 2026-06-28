@@ -2,14 +2,14 @@
 // ==============================================================
 //
 // Drop this file into any React 18+ project (Vite, CRA, Next, etc.)
-// alongside the `@ironfighter23/aether-core` package on npm.
+// alongside the `@nishantbhatte/aether-core` package on npm.
 // Open the app in two browser tabs. They sync.
 //
 // The useAether hook has the same shape as useState. That's the only
 // thing you need to know. Everything else -- WebSocket reconnects,
 // offline cache, conflict resolution -- happens inside the hook.
 
-import { useAether, useAetherSupersede } from '@ironfighter23/aether-core/react';
+import { useAether, useAetherSupersede } from '@nishantbhatte/aether-core/react';
 
 export default function Counter() {
     // Same shape as useState, but the value is shared across every

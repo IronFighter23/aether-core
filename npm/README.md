@@ -1,17 +1,17 @@
-# @ironfighter23/aether-core
+# @nishantbhatte/aether-core
 
 Zero-Transit sync engine for the browser. Your frontend variables *are* the database.
 
 CRDT-backed, offline-first, real-time. No backend code to write — just connect to the Python relay and read/write keys.
 
 ```bash
-npm install @ironfighter23/aether-core
+npm install @nishantbhatte/aether-core
 ```
 
 ## Vanilla JS — 6 lines
 
 ```js
-import Aether from '@ironfighter23/aether-core';
+import Aether from '@nishantbhatte/aether-core';
 
 const aether = new Aether('ws://localhost:8211');
 await aether.ready();
@@ -25,7 +25,7 @@ Open the same page in two browser tabs. They sync. With **zero** backend code be
 ## React — `useAether` hook
 
 ```jsx
-import { useAether } from '@ironfighter23/aether-core/react';
+import { useAether } from '@nishantbhatte/aether-core/react';
 
 function Counter() {
   const [count, setCount] = useAether('count', 0, {
@@ -46,7 +46,7 @@ Same shape as `useState`. Same component, two tabs, real-time sync.
 Set the URL once instead of repeating it in every hook:
 
 ```jsx
-import { configureAether, useAether } from '@ironfighter23/aether-core/react';
+import { configureAether, useAether } from '@nishantbhatte/aether-core/react';
 
 configureAether({ url: 'ws://localhost:8211', authToken: 'optional-shared-secret' });
 
@@ -77,7 +77,7 @@ aether.onSupersede((key, attempted, actual) => {
 In React:
 
 ```jsx
-import { useAetherSupersede } from '@ironfighter23/aether-core/react';
+import { useAetherSupersede } from '@nishantbhatte/aether-core/react';
 
 function MyComponent() {
   useAetherSupersede((key, attempted, actual) => {

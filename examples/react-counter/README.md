@@ -11,7 +11,7 @@ The cleanest path is Vite — one command and you're done:
 ```bash
 npm create vite@latest my-aether-app -- --template react
 cd my-aether-app
-npm install @ironfighter23/aether-core
+npm install @nishantbhatte/aether-core
 ```
 
 Then replace `src/App.jsx` with the contents of `App.jsx` in this folder.
@@ -54,7 +54,7 @@ If you're going to call `useAether` from many components, set the URL
 once at app startup:
 
 ```jsx
-import { configureAether } from '@ironfighter23/aether-core/react';
+import { configureAether } from '@nishantbhatte/aether-core/react';
 
 configureAether({ url: 'ws://localhost:8211' });
 ```

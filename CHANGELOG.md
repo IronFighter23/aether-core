@@ -55,7 +55,7 @@ field is opt-in.
   parameter (the fast path) AND as a first-frame
   `{type:"auth",token:"..."}` message (the safety net for proxies
   that strip query strings).
-- **Official React bindings** (`@ironfighter23/aether-core/react`):
+- **Official React bindings** (`@nishantbhatte/aether-core/react`):
     - `useAether(key, defaultValue, options)` — `useState`-shaped
       hook bound to a single CRDT key. Re-renders only when that
       one key changes.
@@ -65,7 +65,7 @@ field is opt-in.
       supersede callback from inside a component.
     - `configureAether(config)` / `getAether(opts)` — app-wide
       default URL/auth and imperative access for event handlers.
-- **`@ironfighter23/aether-core` npm package.** Dual ESM/CJS
+- **`@nishantbhatte/aether-core` npm package.** Dual ESM/CJS
   entries, React subpath under `./react`, TypeScript declarations
   for both. `npm pack --dry-run` produces a clean ~20 kB tarball.
 - **Two copy-paste examples** under `examples/`:

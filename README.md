@@ -6,7 +6,18 @@
 [![security](https://img.shields.io/badge/security-auth%20%2B%20rate--limited%20%2B%20bounded-blue)](SECURITY.md)
 [![benchmarks](https://img.shields.io/badge/p50%20roundtrip-0.21%20ms-brightgreen)](BENCHMARKS.md)
 [![license](https://img.shields.io/badge/license-MIT-lightgrey)](LICENSE)
-[![npm](https://img.shields.io/badge/npm-%40ironfighter23%2Faether--core-cb3837?logo=npm)](https://www.npmjs.com/package/@ironfighter23/aether-core)
+[![npm](https://img.shields.io/badge/npm-%40nishantbhatte%2Faether--core-cb3837?logo=npm)](https://www.npmjs.com/package/@nishantbhatte/aether-core)
+
+## Install
+
+```bash
+pip install aether-zta                      # Python relay + CLI
+npm install @nishantbhatte/aether-core      # Browser client + React hooks
+```
+
+Then point your client at the relay (`ws://localhost:8211`) â€” see [Quickstart](#quickstart) below.
+
+---
 
 Aether-Core eliminates backend business logic entirely. The application
 lives in the browser: a local CRDT engine holds every piece of state as
@@ -70,7 +81,7 @@ python run_demo.py
 | --- | --- |
 | `AuthConfig(token=...)` | Shared-secret auth for both `ClientGateway` (browsers) and `MeshNode` (federated peers). Constant-time comparison; fail-closed; verified **before** the snapshot is sent so a rejected client never sees any state. |
 | `ssl_context=` | TLS / `wss://` for both browser-facing and peer-facing sockets. The gateway `url` switches scheme automatically. |
-| `useAether(key, default)` | First-class React hook with the same shape as `useState`. Ships as `@ironfighter23/aether-core/react` on npm. |
+| `useAether(key, default)` | First-class React hook with the same shape as `useState`. Ships as `@nishantbhatte/aether-core/react` on npm. |
 | `onSupersede(cb)` | JavaScript callback that fires when one of your writes lost an LWW race. The math doesn't drop writes; this tells you when one of *yours* wasn't the final value. |
 | Bounded `_seen` + `oplog` | Both previously-unbounded dedup/log structures are now FIFO-evicted via `SecurityLimits.max_seen_stamps` (default 100 000) and `max_oplog_size` (default 10 000). Long-running federations no longer leak memory. |
 
@@ -79,7 +90,7 @@ Full list in [`CHANGELOG.md`](CHANGELOG.md). Migration: zero breaking changes â€
 ### React in 25 lines
 
 ```jsx
-import { useAether } from '@ironfighter23/aether-core/react';
+import { useAether } from '@nishantbhatte/aether-core/react';
 
 export default function Counter() {
   const [count, setCount] = useAether('count', 0, {
